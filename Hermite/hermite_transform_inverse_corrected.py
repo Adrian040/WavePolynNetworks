@@ -182,18 +182,22 @@ def energy_image(coeffs, include_dc=False):
 
 def save_coefficients_grid(coeffs, output_path, title="Coeficientes Hermite"):
     orders = list(coeffs.keys())
-    n = len(orders)
-    cols = min(4, n)
-    rows = int(np.ceil(n / cols))
+    max_m = max(m for m, _ in orders)
+    max_n = max(n for _, n in orders)
+    cols = max_m + 1
+    rows = max_n + 1
 
-    plt.figure(figsize=(3 * cols, 3 * rows))
-    for idx, k in enumerate(orders):
-        plt.subplot(rows, cols, idx + 1)
-        plt.imshow(normalize01(coeffs[k]), cmap="gray")
-        plt.title(f"L{k[0]},{k[1]}")
-        plt.axis("off")
+    fig, axes = plt.subplots(rows, cols, figsize=(3 * cols, 3 * rows), squeeze=False)
+    for n in range(rows):
+        for m in range(cols):
+            ax = axes[n, m]
+            k = (m, n)
+            if k in coeffs:
+                ax.imshow(normalize01(coeffs[k]), cmap="gray")
+                ax.set_title(rf"$L_{{{m},{n}}}$")
+            ax.axis("off")
 
-    plt.suptitle(title)
+    fig.suptitle(title)
     plt.tight_layout()
     plt.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close()
