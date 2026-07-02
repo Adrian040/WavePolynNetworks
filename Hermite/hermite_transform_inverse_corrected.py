@@ -43,7 +43,14 @@ def hermite_orders(max_order):
 # -------------------------
 
 def hermite_basis(max_order=3, sigma=2.0, kernel_size=None, discrete_normalize=True):
-    """Crea G_mn(x,y) y la ventana gaussiana w(x,y)."""
+    """
+    Crea la base polinomial G_mn(x,y) y la ventana gaussiana w(x,y).
+
+    Implementa la ventana gaussiana del articulo (Ec. 2) y los polinomios
+    Hermite normalizados asociados a esa ventana (Ec. 3). La opcion
+    ``discrete_normalize`` compensa el muestreo finito de la ventana para
+    mejorar la estabilidad numerica en imagenes discretas.
+    """
     if kernel_size is None:
         kernel_size = int(2 * np.ceil(3 * sigma) + 1)
     if kernel_size % 2 == 0:
@@ -54,7 +61,8 @@ def hermite_basis(max_order=3, sigma=2.0, kernel_size=None, discrete_normalize=T
     xs = x / sigma
     ys = y / sigma
 
-    # Ventana gaussiana sin constante global. La constante global se cancela en la normalización.
+    # Articulo, Ec. (2): ventana gaussiana. La constante global se cancela
+    # durante la normalizacion discreta usada aqui.
     w = np.exp(-(xs**2 + ys**2) / 2).astype(np.float32)
     w2 = w**2
 
@@ -62,7 +70,7 @@ def hermite_basis(max_order=3, sigma=2.0, kernel_size=None, discrete_normalize=T
     for m, n in hermite_orders(max_order):
         total = m + n
 
-        # Constante de normalización del paper para los polinomios Hermite:
+        # Articulo, Ec. (3): constante de normalizacion para G_mn.
         # 1 / sqrt(2^(m+n) m! n!)
         const = 1.0 / np.sqrt((2.0 ** total) * factorial(m) * factorial(n))
 
@@ -92,12 +100,20 @@ def hermite_coefficients(
     boundary="symm",
     discrete_normalize=True,
 ):
-    """Transformada de Hermite directa: L_mn = I * D_mn, con D_mn = G_mn w^2."""
+    """
+    Calcula la transformada de Hermite directa.
+
+    Devuelve los coeficientes cartesianos L_mn en todos los pixeles. En el
+    articulo, estos coeficientes se obtienen convolucionando la imagen con
+    D_mn = G_mn * w^2 y muestreando en la reticula de analisis (Ec. 5). Aqui
+    se usa una reticula densa: hay un coeficiente por pixel.
+    """
     img = read_image(image)
     basis, w, w2 = hermite_basis(max_order, sigma, kernel_size, discrete_normalize)
 
     coeffs = {}
     for k, G in basis.items():
+        # Articulo, Ec. (5): filtro de analisis D_mn = G_mn * w^2.
         D = G * w2
         coeffs[k] = correlate2d(img, D, mode="same", boundary=boundary).astype(np.float32)
 
@@ -106,9 +122,14 @@ def hermite_coefficients(
 
 def inverse_hermite_transform(coeffs, basis, w, image_shape, boundary="fill"):
     """Reconstrucción por síntesis/overlap-add usando los coeficientes Hermite."""
+    # Articulo, Ec. (6): transformada polinomial inversa. Los coeficientes
+    # deben estar en la base cartesiana; si estan rotados, primero se aplica
+    # inverse_rotate_coefficients().
     numerator = np.zeros(image_shape, dtype=np.float32)
 
     for k, c_map in coeffs.items():
+        # Filtro de sintesis P_mn de la Ec. (6), implementado como G_mn*w
+        # y una normalizacion global por W(x,y) al final.
         S = basis[k] * w
         numerator += convolve2d(c_map, S, mode="same", boundary=boundary, fillvalue=0).astype(np.float32)
 
@@ -130,7 +151,13 @@ def inverse_hermite_transform(coeffs, basis, w, image_shape, boundary="fill"):
 # -------------------------
 
 def dominant_theta(coeffs):
-    """theta = arctan2(L_01, L_10)."""
+    """
+    Estima la orientacion local dominante desde coeficientes de primer orden.
+
+    El articulo usa tan(theta)=L_01/L_10 para el angulo local (Fig. 3 y
+    paso 2 del metodo de fusion). En codigo se usa arctan2 para conservar
+    cuadrante y evitar divisiones inestables.
+    """
     if (1, 0) not in coeffs or (0, 1) not in coeffs:
         return np.zeros_like(next(iter(coeffs.values())), dtype=np.float32)
     theta = np.arctan2(coeffs[(0, 1)], coeffs[(1, 0)] + 1e-8)
@@ -138,7 +165,13 @@ def dominant_theta(coeffs):
 
 
 def rotate_coefficients(coeffs, theta, max_order):
-    """Rota todos los coeficientes con Dx'=cos(theta)Dx+sin(theta)Dy."""
+    """
+    Rota coeficientes cartesianos L_mn al sistema local indicado por theta.
+
+    Esta es la forma en dominio espacial de la propiedad de steering de los
+    filtros Hermite (articulo, Ecs. 7-10): cada coeficiente rotado es una
+    combinacion lineal de coeficientes cartesianos del mismo orden total.
+    """
     c = np.cos(theta)
     s = np.sin(theta)
     rotated = {}
@@ -156,6 +189,18 @@ def rotate_coefficients(coeffs, theta, max_order):
         rotated[(a, b)] = out.astype(np.float32)
 
     return rotated
+
+
+def inverse_rotate_coefficients(rotated_coeffs, theta, max_order):
+    """
+    Recupera coeficientes cartesianos desde coeficientes rotados.
+
+    La matriz de steering es una rotacion por bloques de mismo orden total,
+    por lo que su inversa se obtiene aplicando la misma transformacion con
+    angulo ``-theta``. Esta etapa debe ejecutarse antes de la transformada
+    inversa cuando los coeficientes disponibles estan rotados.
+    """
+    return rotate_coefficients(rotated_coeffs, -theta, max_order=max_order)
 
 
 # -------------------------
@@ -237,6 +282,26 @@ def reconstruction_metrics(original, reconstructed):
     return {"mse": float(mse), "rmse": float(rmse), "mae": float(mae), "psnr": float(psnr)}
 
 
+def coefficient_roundtrip_metrics(original_coeffs, recovered_coeffs):
+    """
+    Mide el error de la ruta coeficientes -> rotacion -> rotacion inversa.
+
+    Es util para confirmar que la etapa de steering inverso recupera los
+    coeficientes cartesianos antes de alimentar la transformada inversa.
+    """
+    diffs = []
+    for k in original_coeffs:
+        diffs.append((original_coeffs[k] - recovered_coeffs[k]).ravel())
+    diff = np.concatenate(diffs).astype(np.float32)
+    mse = np.mean(diff**2)
+    return {
+        "mse": float(mse),
+        "rmse": float(np.sqrt(mse)),
+        "mae": float(np.mean(np.abs(diff))),
+        "max_abs_error": float(np.max(np.abs(diff))),
+    }
+
+
 # -------------------------
 # Función principal
 # -------------------------
@@ -247,6 +312,8 @@ def hermite_transform_image(
     sigma=2.0,
     kernel_size=None,
     use_rotated=True,
+    use_inverse_rotation=None,
+    use_inverse_transform=True,
     use_dominant_orientation=True,
     angle=0.0,
     angle_unit="degrees",
@@ -257,6 +324,31 @@ def hermite_transform_image(
     channel_axis="last",
     discrete_normalize=True,
 ):
+    """
+    Ejecuta la transformada de Hermite y las etapas opcionales del flujo.
+
+    Flujo completo:
+        imagen -> coeficientes cartesianos -> coeficientes rotados ->
+        rotacion inversa -> coeficientes cartesianos recuperados ->
+        transformada inversa -> imagen reconstruida.
+
+    Parametros de flujo
+    -------------------
+    use_rotated:
+        Si True, calcula coeficientes rotados a partir de los cartesianos.
+    use_inverse_rotation:
+        Si True, aplica la rotacion inversa para recuperar coeficientes
+        cartesianos. Si es None, se activa automaticamente cuando se pide
+        reconstruccion de imagen despues de una rotacion.
+    use_inverse_transform:
+        Si True, aplica la transformada inversa. Sin rotacion reconstruye
+        directamente desde ``normal_coeffs``; con rotacion reconstruye desde
+        ``recovered_coeffs``.
+
+    Con estos parametros se pueden ejecutar subflujos: solo transformada
+    (use_rotated=False, use_inverse_transform=False), transformada+inversa
+    sin rotar, transformada+rotacion, o el ciclo completo.
+    """
     img = read_image(image)
 
     # Transformada normal corregida: usa G_mn con constante del paper y D_mn = G_mn w^2.
@@ -268,22 +360,55 @@ def hermite_transform_image(
         discrete_normalize=discrete_normalize,
     )
 
-    # Inversa de la transformada normal. Esta es la prueba de consistencia de la HT.
-    reconstructed = inverse_hermite_transform(normal_coeffs, basis, w, img.shape)
-    metrics = reconstruction_metrics(img, np.clip(reconstructed, 0, 1))
+    # Variables que se llenan solo si el usuario pide esas etapas del flujo.
+    reconstructed = None
+    metrics = None
+    recovered_coeffs = None
+    coefficient_metrics = None
+
+    if use_inverse_rotation is None:
+        use_inverse_rotation = bool(use_rotated and use_inverse_transform)
+    if use_inverse_rotation and not use_rotated:
+        raise ValueError("use_inverse_rotation=True requiere use_rotated=True.")
 
     theta = None
     if use_rotated:
         if use_dominant_orientation:
             theta = dominant_theta(normal_coeffs)
         else:
-            theta_value = np.deg2rad(angle) if angle_unit == "degrees" else angle
+            if angle_unit == "degrees":
+                theta_value = np.deg2rad(angle)
+            elif angle_unit == "radians":
+                theta_value = angle
+            else:
+                raise ValueError("angle_unit debe ser 'degrees' o 'radians'.")
             theta = np.full_like(img, theta_value, dtype=np.float32)
         coeffs = rotate_coefficients(normal_coeffs, theta, max_order=max_order)
         title = "Coeficientes Hermite rotados"
     else:
         coeffs = normal_coeffs
         title = "Coeficientes Hermite normales"
+
+    # Rotacion inversa: coeficientes rotados -> coeficientes cartesianos.
+    # Esta etapa cierra el ciclo de steering antes de usar la inversa Hermite.
+    if use_inverse_rotation:
+        recovered_coeffs = inverse_rotate_coefficients(
+            coeffs,
+            theta,
+            max_order=max_order,
+        )
+        coefficient_metrics = coefficient_roundtrip_metrics(normal_coeffs, recovered_coeffs)
+
+    if use_inverse_transform and use_rotated and not use_inverse_rotation:
+        raise ValueError(
+            "Para reconstruir despues de rotar se requiere use_inverse_rotation=True "
+            "o use_inverse_rotation=None."
+        )
+
+    if use_inverse_transform:
+        reconstruction_coeffs = recovered_coeffs if use_rotated else normal_coeffs
+        reconstructed = inverse_hermite_transform(reconstruction_coeffs, basis, w, img.shape)
+        metrics = reconstruction_metrics(img, np.clip(reconstructed, 0, 1))
 
     orders = hermite_orders(max_order)
     transformed_image = energy_image(coeffs)
@@ -292,22 +417,31 @@ def hermite_transform_image(
     if save_image:
         save_coefficients_grid(coeffs, output_path, title=title)
 
-    if save_reconstruction:
+    if save_reconstruction and reconstructed is not None:
         save_reconstruction_comparison(img, np.clip(reconstructed, 0, 1), reconstruction_path)
+
+    reconstructed_image = None
+    if reconstructed is not None:
+        reconstructed_image = np.clip(reconstructed, 0, 1).astype(np.float32)
 
     return {
         "transformed_image": transformed_image,
         "coeff_stack": coeff_stack,
         "coeffs": coeffs,
         "normal_coeffs": normal_coeffs,
+        "rotated_coeffs": coeffs if use_rotated else None,
+        "recovered_coeffs": recovered_coeffs,
         "orders": orders,
         "theta": theta,
-        "reconstructed_image": np.clip(reconstructed, 0, 1).astype(np.float32),
+        "reconstructed_image": reconstructed_image,
         "reconstruction_metrics": metrics,
+        "coefficient_roundtrip_metrics": coefficient_metrics,
+        "used_inverse_rotation": use_inverse_rotation,
+        "used_inverse_transform": use_inverse_transform,
         "basis": basis,
         "window": w,
         "output_path": output_path if save_image else None,
-        "reconstruction_path": reconstruction_path if save_reconstruction else None,
+        "reconstruction_path": reconstruction_path if save_reconstruction and reconstructed is not None else None,
     }
 
 
@@ -317,6 +451,8 @@ if __name__ == "__main__":
         max_order=5,
         sigma=2.0,
         use_rotated=True,
+        use_inverse_rotation=True,
+        use_inverse_transform=True,
         use_dominant_orientation=True,
         save_image=True,
         output_path="coeficientes_hermite_rotados.png",
@@ -325,5 +461,6 @@ if __name__ == "__main__":
     )
     print("Imagen transformada:", result["transformed_image"].shape)
     print("Stack de coeficientes:", result["coeff_stack"].shape)
+    print("Metricas rotacion inversa:", result["coefficient_roundtrip_metrics"])
     print("Órdenes:", result["orders"])
     print("Métricas reconstrucción:", result["reconstruction_metrics"])
