@@ -1,10 +1,10 @@
 import os
 import re
 import numpy as np
-from PIL import Image
 import torch
 from torch.utils.data import Dataset
 import albumentations as A
+import tifffile as tiff  
 
 def _extract_id(filename: str) -> str:
     """Extrae el número identificador del archivo, ej. 'tr_im0000.tif' -> '0000'."""
@@ -30,13 +30,15 @@ class LungDataset(Dataset):
         return len(self.pairs)
 
     def _load_image(self, path):
-        arr = np.array(Image.open(path)).astype(np.float32)
+        # MODIFICACIÓN: Usar tifffile en lugar de PIL para preservar los datos crudos del CT
+        arr = tiff.imread(path).astype(np.float32)
         arr = np.clip(arr, self.hu_min, self.hu_max)
         arr = (arr - self.hu_min) / (self.hu_max - self.hu_min)
         return arr # Retorna array 2D en rango [0, 1]
 
     def _load_mask(self, path):
-        arr = np.array(Image.open(path)).astype(np.int64)
+        # MODIFICACIÓN: Usar tifffile también para la máscara
+        arr = tiff.imread(path).astype(np.int64)
         return arr # Retorna array 2D
 
     def __getitem__(self, idx):
