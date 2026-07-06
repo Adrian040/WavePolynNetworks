@@ -6,7 +6,7 @@ import json
 @dataclass
 class UNetConfig:
     in_channels: int = 1                  # canales de entrada (1=grayscale, 3=RGB)
-    out_channels: int = 3                # canales de salida (1=binario, N=multiclase)
+    out_channels: int = 4                # canales de salida (1=binario, N=multiclase)
     features: List[int] = field(          # filtros por nivel del encoder
         default_factory=lambda: [64, 128, 256, 512]
     )
