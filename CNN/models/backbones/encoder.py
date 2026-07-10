@@ -2,12 +2,14 @@ import torch
 import torch.nn as nn
 from typing import List
 from ..blocks.conv import DoubleConv
+from wavelet.dwt import HaarDWT
 class Encoder(nn.Module):
     def __init__(self, in_channels: int, features: List[int]) -> None:
         super().__init__()
 
         self.downs = nn.ModuleList() # Lista dinámica de bloques del encoder
-        self.pool  = nn.MaxPool2d(kernel_size=2, stride=2) # Reduce la resolución a la mitad
+        self.dwt = HaarDWT()  # Reduce la resolución mediante Wavelet Haar
+    
 
         ch = in_channels 
         for feat in features:
@@ -19,10 +21,16 @@ class Encoder(nn.Module):
 
     def forward(self, x: torch.Tensor):
         skips = []
+        wavelet_details = []
+
         for down in self.downs:
-            x = down(x) 
-            skips.append(x)   
-            x = self.pool(x)
+            x = down(x)
+            skips.append(x)
+
+            # Aplica la DWT y guarda las bandas de detalle.
+            x, details = self.dwt(x)
+            wavelet_details.append(details)
 
         x = self.bottleneck(x)
-        return x, skips
+
+        return x, skips, wavelet_details

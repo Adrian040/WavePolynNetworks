@@ -1,54 +1,114 @@
 import torch
 import torch.nn as nn
-from typing import List
+import torch.nn.functional as F
+from typing import List, Tuple
 
 from ..blocks.conv import DoubleConv
+from Wavelet.idwt import HaarIDWT
 
 
 class UpBlock(nn.Module):
 
-    def __init__(self, in_channels: int, out_channels: int, bilinear: bool) -> None:
+    def __init__(self, in_channels: int, out_channels: int) -> None:
         super().__init__()
 
-        if bilinear:
-            self.up   = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
-            self.conv = DoubleConv(in_channels, out_channels)
-        else:
-            # ConvTranspose2d  aprende a interpolar y refinar características
-            self.up   = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
-            self.conv = DoubleConv(in_channels, out_channels)
+        # Ajusta los canales de x para que coincidan con LH, HL y HH.
+        self.reduce_channels = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=1
+        )
 
-    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        x = self.up(x)
+        # Reconstruye el tamaño usando las cuatro bandas Wavelet.
+        self.idwt = HaarIDWT()
 
-        # Ajuste de padding si el tamaño no encaja exactamente (inputs no multiplos de 2^n)
-        if x.shape != skip.shape:
-            x = nn.functional.pad(x, [0, skip.shape[3] - x.shape[3],
-                                       0, skip.shape[2] - x.shape[2]])
+        # Después de concatenar: skip + reconstrucción.
+        self.conv = DoubleConv(
+            out_channels * 2,
+            out_channels
+        )
 
-        x = torch.cat([skip, x], dim=1)   # concatenar por canales 
+    def forward(
+        self,
+        x: torch.Tensor,
+        skip: torch.Tensor,
+        details: Tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor
+        ]
+    ) -> torch.Tensor:
+
+        # Reduce los canales para formar la banda LL.
+        x = self.reduce_channels(x)
+
+        # Reconstruye: LL + LH + HL + HH.
+        x = self.idwt(x, details)
+
+        # Ajusta el tamaño espacial si fuera necesario.
+        if x.shape[2:] != skip.shape[2:]:
+            x = F.interpolate(
+                x,
+                size=skip.shape[2:],
+                mode="bilinear",
+                align_corners=False
+            )
+
+        # Une la reconstrucción con el skip de la U-Net.
+        x = torch.cat([skip, x], dim=1)
+
         return self.conv(x)
 
 
 class Decoder(nn.Module):
-  
-    def __init__(self, features: List[int], bilinear: bool = False) -> None:
+
+    def __init__(
+        self,
+        features: List[int],
+        bilinear: bool = False
+    ) -> None:
         super().__init__()
 
-        # features viene de mayor a menor: [512, 256, 128, 64]
+        # Ejemplo: [64, 128, 256, 512]
         reversed_feats = list(reversed(features))
 
         self.ups = nn.ModuleList()
-        in_ch = reversed_feats[0] * 2   # canales del bottleneck
 
-        for feat in reversed_feats:
-            self.ups.append(UpBlock(in_ch, feat, bilinear))
-            in_ch = feat
+        # Salida del bottleneck: 512 × 2 = 1024 canales.
+        in_channels = reversed_feats[0] * 2
 
-    def forward(self, x: torch.Tensor, skips: List[torch.Tensor]) -> torch.Tensor:
+        for out_channels in reversed_feats:
+            self.ups.append(
+                UpBlock(
+                    in_channels=in_channels,
+                    out_channels=out_channels
+                )
+            )
+
+            in_channels = out_channels
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        skips: List[torch.Tensor],
+        wavelet_details: List[
+            Tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor
+            ]
+        ]
+    ) -> torch.Tensor:
+
+        # El decoder empieza desde el nivel más profundo.
         skips = list(reversed(skips))
+        wavelet_details = list(reversed(wavelet_details))
 
-        for up, skip in zip(self.ups, skips):
-            x = up(x, skip)
+        for up, skip, details in zip(
+            self.ups,
+            skips,
+            wavelet_details
+        ):
+            x = up(x, skip, details)
 
         return x

@@ -29,8 +29,14 @@ class UNet(nn.Module):
         self._init_weights()  # Inicializa los pesos.
    # Flujo principal del modelo U-Net
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x, skips   = self.encoder(x) 
-        x          = self.decoder(x, skips)
+        x, skips, wavelet_details = self.encoder(x)
+
+        x = self.decoder(
+            x,
+            skips,
+            wavelet_details
+        )
+
         return self.head(x)
 
    # Inicializa los pesos del modelo.
