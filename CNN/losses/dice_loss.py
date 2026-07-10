@@ -27,6 +27,6 @@ class DiceLoss(nn.Module):
         union = probs.sum(dims) + targets_onehot.sum(dims)
 
         dice_per_class = (2 * intersection + self.smooth) / (union + self.smooth)
-        dice_per_class = dice_per_class[start_class:]  # excluye fondo si aplica
+        dice_per_class = dice_per_class[start_class:]  # excluye fondo 
 
         return 1 - dice_per_class.mean()
