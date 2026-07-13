@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from typing import List
 from ..blocks.conv import DoubleConv
-from wavelet.dwt import HaarDWT
+from Wavelet.dwt import HaarDWT
 class Encoder(nn.Module):
     def __init__(self, in_channels: int, features: List[int]) -> None:
         super().__init__()

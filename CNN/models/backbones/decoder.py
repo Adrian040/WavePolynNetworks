@@ -7,22 +7,33 @@ from ..blocks.conv import DoubleConv
 from Wavelet.idwt import HaarIDWT
 
 
+WaveletDetails = Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor
+]
+
+
 class UpBlock(nn.Module):
 
-    def __init__(self, in_channels: int, out_channels: int) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int
+    ) -> None:
         super().__init__()
 
-        # Ajusta los canales de x para que coincidan con LH, HL y HH.
+        # Ajusta x al número de canales de las bandas Wavelet.
         self.reduce_channels = nn.Conv2d(
             in_channels,
             out_channels,
             kernel_size=1
         )
 
-        # Reconstruye el tamaño usando las cuatro bandas Wavelet.
+        # Duplica la resolución usando LL, LH, HL y HH.
         self.idwt = HaarIDWT()
 
-        # Después de concatenar: skip + reconstrucción.
+        # Procesa la concatenación de la IDWT y el skip.
         self.conv = DoubleConv(
             out_channels * 2,
             out_channels
@@ -32,20 +43,16 @@ class UpBlock(nn.Module):
         self,
         x: torch.Tensor,
         skip: torch.Tensor,
-        details: Tuple[
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor
-        ]
+        details: WaveletDetails
     ) -> torch.Tensor:
 
-        # Reduce los canales para formar la banda LL.
+        # Convierte x en la banda LL del nivel actual.
         x = self.reduce_channels(x)
 
-        # Reconstruye: LL + LH + HL + HH.
+        # Reconstruye usando LL junto con LH, HL y HH.
         x = self.idwt(x, details)
 
-        # Ajusta el tamaño espacial si fuera necesario.
+        # Corrige únicamente diferencias espaciales.
         if x.shape[2:] != skip.shape[2:]:
             x = F.interpolate(
                 x,
@@ -54,7 +61,7 @@ class UpBlock(nn.Module):
                 align_corners=False
             )
 
-        # Une la reconstrucción con el skip de la U-Net.
+        # Une la reconstrucción con el skip.
         x = torch.cat([skip, x], dim=1)
 
         return self.conv(x)
@@ -69,12 +76,13 @@ class Decoder(nn.Module):
     ) -> None:
         super().__init__()
 
-        # Ejemplo: [64, 128, 256, 512]
+        # bilinear se conserva por compatibilidad,
+        # pero la IDWT realiza el aumento de resolución.
         reversed_feats = list(reversed(features))
 
         self.ups = nn.ModuleList()
 
-        # Salida del bottleneck: 512 × 2 = 1024 canales.
+        # Canales provenientes del bottleneck.
         in_channels = reversed_feats[0] * 2
 
         for out_channels in reversed_feats:
@@ -91,16 +99,10 @@ class Decoder(nn.Module):
         self,
         x: torch.Tensor,
         skips: List[torch.Tensor],
-        wavelet_details: List[
-            Tuple[
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor
-            ]
-        ]
+        wavelet_details: List[WaveletDetails]
     ) -> torch.Tensor:
 
-        # El decoder empieza desde el nivel más profundo.
+        # Comienza desde el nivel más profundo.
         skips = list(reversed(skips))
         wavelet_details = list(reversed(wavelet_details))
 

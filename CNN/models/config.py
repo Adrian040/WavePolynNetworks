@@ -12,6 +12,10 @@ class UNetConfig:
     )
     bilinear: bool = False                # False=ConvTranspose2d (paper original)
     dropout: float = 0.0                  # sin dropout en la clásica
+    #Configuracion wavelet
+
+    use_wavelet: bool = False
+    wavelet_type: str = "haar"
     def to_dict(self) -> dict:
         return {
             "in_channels": self.in_channels,
@@ -19,6 +23,8 @@ class UNetConfig:
             "features": self.features,
             "bilinear": self.bilinear,
             "dropout": self.dropout,
+            "use_wavelet": self.use_wavelet,
+            "wavelet_type": self.wavelet_type,
         }
 
     def save(self, path: str) -> None:
