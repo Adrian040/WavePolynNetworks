@@ -102,19 +102,69 @@ class Decoder(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        skips: List[torch.Tensor],
-        wavelet_details: List[WaveletDetails]
-    ) -> torch.Tensor:
+        skip: torch.Tensor,
+        details: WaveletDetails
+        ) -> torch.Tensor:
 
-        # Comienza desde el nivel más profundo.
-        skips = list(reversed(skips))
-        wavelet_details = list(reversed(wavelet_details))
+        # Convierte x en la banda LL del nivel actual.
+        x = self.reduce_channels(x)
 
-        for up, skip, details in zip(
-            self.ups,
-            skips,
-            wavelet_details
-        ):
-            x = up(x, skip, details)
+        lh, hl, hh = details
 
-        return x
+        # Diagnóstico de las bandas antes de la IDWT.
+        print("\n========== BANDAS ANTES DE IDWT ==========")
+
+        print(
+            f"LL -> min: {x.min().item():.4f}, "
+            f"max: {x.max().item():.4f}, "
+            f"mean: {x.mean().item():.4f}, "
+            f"std: {x.std().item():.4f}"
+        )
+
+        print(
+            f"LH -> min: {lh.min().item():.4f}, "
+            f"max: {lh.max().item():.4f}, "
+            f"mean: {lh.mean().item():.4f}, "
+            f"std: {lh.std().item():.4f}"
+        )
+
+        print(
+            f"HL -> min: {hl.min().item():.4f}, "
+            f"max: {hl.max().item():.4f}, "
+            f"mean: {hl.mean().item():.4f}, "
+            f"std: {hl.std().item():.4f}"
+        )
+
+        print(
+            f"HH -> min: {hh.min().item():.4f}, "
+            f"max: {hh.max().item():.4f}, "
+            f"mean: {hh.mean().item():.4f}, "
+            f"std: {hh.std().item():.4f}"
+        )
+
+        # Reconstruye usando LL junto con LH, HL y HH.
+        x = self.idwt(
+            x,
+            (lh, hl, hh)
+        )
+
+        print(
+            f"IDWT -> min: {x.min().item():.4f}, "
+            f"max: {x.max().item():.4f}, "
+            f"mean: {x.mean().item():.4f}, "
+            f"std: {x.std().item():.4f}"
+        )
+
+        # Corrige diferencias espaciales.
+        if x.shape[2:] != skip.shape[2:]:
+            x = F.interpolate(
+                x,
+                size=skip.shape[2:],
+                mode="bilinear",
+                align_corners=False
+            )
+
+        # Une la reconstrucción con el skip.
+        x = torch.cat([skip, x], dim=1)
+
+        return self.conv(x)
