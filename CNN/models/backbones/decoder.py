@@ -78,20 +78,9 @@ class UpBlock(nn.Module):
                 mode="bilinear",
                 align_corners=False
             )
-            # --- DEBUG: comparar escalas antes del cat ---
-        print(
-            f"x   -> mean: {x.mean().item():.4f}, std: {x.std().item():.4f}, "
-            f"min: {x.min().item():.4f}, max: {x.max().item():.4f}"
-        )
-        print(
-            f"skip-> mean: {skip.mean().item():.4f}, std: {skip.std().item():.4f}, "
-            f"min: {skip.min().item():.4f}, max: {skip.max().item():.4f}"
-        )
-        print("---")
-        # --- FIN DEBUG -
+       
         x = self.align_norm(x)
-        print(f"[DEBUG align_norm] std: {x.std().item():.4f}, mean: {x.mean().item():.4f}")
-        # Une la salida reconstruida con la conexión skip.
+      
         x = torch.cat(
             [skip, x],
             dim=1
