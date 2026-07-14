@@ -25,15 +25,14 @@ class UpBlock(nn.Module):
 
         # Ajusta y normaliza la banda LL aprendida.
         self.reduce_channels = nn.Sequential(
-            nn.Conv2d(
-                in_channels,
-                out_channels,
-                kernel_size=1,
-                bias=False
-            ),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        )
+    nn.Conv2d(
+        in_channels,
+        out_channels,
+        kernel_size=1,
+        bias=False
+    ),
+    nn.BatchNorm2d(out_channels)
+)
 
         # Duplica la resolución usando LL, LH, HL y HH.
         self.idwt = HaarIDWT()
