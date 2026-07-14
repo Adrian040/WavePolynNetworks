@@ -90,6 +90,7 @@ class UpBlock(nn.Module):
         print("---")
         # --- FIN DEBUG -
         x = self.align_norm(x)
+        print(f"[DEBUG align_norm] std: {x.std().item():.4f}, mean: {x.mean().item():.4f}")
         # Une la salida reconstruida con la conexión skip.
         x = torch.cat(
             [skip, x],
