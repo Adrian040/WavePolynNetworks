@@ -25,17 +25,18 @@ class UpBlock(nn.Module):
 
         # Ajusta los canales de LL y normaliza sin depender del batch.
         self.reduce_channels = nn.Sequential(
-            nn.Conv2d(
-                in_channels,
-                out_channels,
-                kernel_size=1,
-                bias=False
-            ),
-            nn.GroupNorm(
-                num_groups=8,
-                num_channels=out_channels
-            )
-        )
+    nn.Conv2d(
+        in_channels,
+        out_channels,
+        kernel_size=1,
+        bias=False
+    ),
+    nn.GroupNorm(
+        num_groups=8,
+        num_channels=out_channels
+    ),
+    nn.GELU() 
+)
 
         # Reconstrucción Wavelet.
         self.idwt = HaarIDWT()
