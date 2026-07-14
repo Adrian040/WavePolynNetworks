@@ -17,8 +17,7 @@ class UNet(nn.Module):
         )
 
         self.decoder = Decoder(
-            features=self.config.features,         # Filtros por cada nivel (inverso).
-            bilinear=self.config.bilinear,         # Tipo de upsampling.
+        features=self.config.features
         )
 
         self.head = SegmentationHead(

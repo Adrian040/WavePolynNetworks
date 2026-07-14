@@ -23,7 +23,7 @@ class UpBlock(nn.Module):
     ) -> None:
         super().__init__()
 
-        # Ajusta y normaliza la banda LL.
+        # Ajusta los canales de LL y normaliza sin depender del batch.
         self.reduce_channels = nn.Sequential(
             nn.Conv2d(
                 in_channels,
@@ -31,24 +31,16 @@ class UpBlock(nn.Module):
                 kernel_size=1,
                 bias=False
             ),
-            nn.BatchNorm2d(out_channels)
+            nn.GroupNorm(
+                num_groups=8,
+                num_channels=out_channels
+            )
         )
 
-        # Escalas aprendibles para las bandas de detalle.
-        self.detail_scale_lh = nn.Parameter(
-            torch.tensor(1.0)
-        )
-
-        self.detail_scale_hl = nn.Parameter(
-            torch.tensor(1.0)
-        )
-
-        self.detail_scale_hh = nn.Parameter(
-            torch.tensor(1.0)
-        )
-
+        # Reconstrucción Wavelet.
         self.idwt = HaarIDWT()
 
+        # Procesa la unión entre la reconstrucción y el skip.
         self.conv = DoubleConv(
             out_channels * 2,
             out_channels
@@ -61,18 +53,13 @@ class UpBlock(nn.Module):
         details: WaveletDetails
     ) -> torch.Tensor:
 
-        # Nueva banda LL.
+        # Convierte x en la nueva banda LL.
         x = self.reduce_channels(x)
 
-        # Bandas de detalle del encoder.
+        # Recupera las bandas del encoder.
         lh, hl, hh = details
 
-        # El modelo aprende cuánto usar de cada banda.
-        lh = self.detail_scale_lh * lh
-        hl = self.detail_scale_hl * hl
-        hh = self.detail_scale_hh * hh
-
-        # Reconstrucción Wavelet.
+        # Reconstruye el siguiente nivel.
         x = self.idwt(
             x,
             (lh, hl, hh)
@@ -86,6 +73,7 @@ class UpBlock(nn.Module):
                 align_corners=False
             )
 
+        # Une la salida reconstruida con la conexión skip.
         x = torch.cat(
             [skip, x],
             dim=1
