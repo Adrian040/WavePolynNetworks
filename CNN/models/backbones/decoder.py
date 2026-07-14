@@ -15,7 +15,6 @@ WaveletDetails = Tuple[
 
 
 class UpBlock(nn.Module):
-
     def __init__(
         self,
         in_channels: int,
@@ -25,21 +24,27 @@ class UpBlock(nn.Module):
 
         # Ajusta los canales de LL y normaliza sin depender del batch.
         self.reduce_channels = nn.Sequential(
-    nn.Conv2d(
-        in_channels,
-        out_channels,
-        kernel_size=1,
-        bias=False
-    ),
-    nn.GroupNorm(
-        num_groups=8,
-        num_channels=out_channels
-    ),
-    nn.GELU() 
-)
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=1,
+                bias=False
+            ),
+            nn.GroupNorm(
+                num_groups=8,
+                num_channels=out_channels
+            ),
+            nn.GELU()
+        )
 
         # Reconstrucción Wavelet.
         self.idwt = HaarIDWT()
+
+        # Normaliza la escala de x reconstruido para igualarla con skip.
+        self.align_norm = nn.GroupNorm(
+            num_groups=8,
+            num_channels=out_channels
+        )
 
         # Procesa la unión entre la reconstrucción y el skip.
         self.conv = DoubleConv(
@@ -84,6 +89,7 @@ class UpBlock(nn.Module):
         )
         print("---")
         # --- FIN DEBUG -
+        x = self.align_norm(x)
         # Une la salida reconstruida con la conexión skip.
         x = torch.cat(
             [skip, x],
