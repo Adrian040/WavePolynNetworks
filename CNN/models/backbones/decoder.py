@@ -23,7 +23,7 @@ class UpBlock(nn.Module):
     ) -> None:
         super().__init__()
 
-        # Ajusta y normaliza la banda LL aprendida.
+        # Ajusta y normaliza la banda LL.
         self.reduce_channels = nn.Sequential(
             nn.Conv2d(
                 in_channels,
@@ -34,10 +34,21 @@ class UpBlock(nn.Module):
             nn.BatchNorm2d(out_channels)
         )
 
-        # Reconstruye usando LL, LH, HL y HH.
+        # Escalas aprendibles para las bandas de detalle.
+        self.detail_scale_lh = nn.Parameter(
+            torch.tensor(1.0)
+        )
+
+        self.detail_scale_hl = nn.Parameter(
+            torch.tensor(1.0)
+        )
+
+        self.detail_scale_hh = nn.Parameter(
+            torch.tensor(1.0)
+        )
+
         self.idwt = HaarIDWT()
 
-        # Procesa la concatenación entre IDWT y skip.
         self.conv = DoubleConv(
             out_channels * 2,
             out_channels
@@ -50,57 +61,23 @@ class UpBlock(nn.Module):
         details: WaveletDetails
     ) -> torch.Tensor:
 
-        # Convierte la salida profunda en la nueva banda LL.
+        # Nueva banda LL.
         x = self.reduce_channels(x)
 
-        # Obtiene las bandas de detalle del encoder.
+        # Bandas de detalle del encoder.
         lh, hl, hh = details
 
-        # Diagnóstico temporal de las bandas.
-        print("\n========== BANDAS ANTES DE IDWT ==========")
+        # El modelo aprende cuánto usar de cada banda.
+        lh = self.detail_scale_lh * lh
+        hl = self.detail_scale_hl * hl
+        hh = self.detail_scale_hh * hh
 
-        print(
-            f"LL -> min: {x.min().item():.4f}, "
-            f"max: {x.max().item():.4f}, "
-            f"mean: {x.mean().item():.4f}, "
-            f"std: {x.std().item():.4f}"
-        )
-
-        print(
-            f"LH -> min: {lh.min().item():.4f}, "
-            f"max: {lh.max().item():.4f}, "
-            f"mean: {lh.mean().item():.4f}, "
-            f"std: {lh.std().item():.4f}"
-        )
-
-        print(
-            f"HL -> min: {hl.min().item():.4f}, "
-            f"max: {hl.max().item():.4f}, "
-            f"mean: {hl.mean().item():.4f}, "
-            f"std: {hl.std().item():.4f}"
-        )
-
-        print(
-            f"HH -> min: {hh.min().item():.4f}, "
-            f"max: {hh.max().item():.4f}, "
-            f"mean: {hh.mean().item():.4f}, "
-            f"std: {hh.std().item():.4f}"
-        )
-
-        # Reconstruye usando las cuatro bandas.
+        # Reconstrucción Wavelet.
         x = self.idwt(
             x,
             (lh, hl, hh)
         )
 
-        print(
-            f"IDWT -> min: {x.min().item():.4f}, "
-            f"max: {x.max().item():.4f}, "
-            f"mean: {x.mean().item():.4f}, "
-            f"std: {x.std().item():.4f}"
-        )
-
-        # Ajusta solo alto y ancho si no coinciden.
         if x.shape[2:] != skip.shape[2:]:
             x = F.interpolate(
                 x,
@@ -109,7 +86,6 @@ class UpBlock(nn.Module):
                 align_corners=False
             )
 
-        # Une la reconstrucción con el skip.
         x = torch.cat(
             [skip, x],
             dim=1
