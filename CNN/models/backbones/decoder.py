@@ -36,7 +36,16 @@ class UpBlock(nn.Module):
             ),
             nn.GELU()
         )
-
+        self.refine_details = nn.ModuleDict({
+        "lh": nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, groups=out_channels, bias=True),
+        "hl": nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, groups=out_channels, bias=True),
+        "hh": nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, groups=out_channels, bias=True),
+        })
+        for conv in self.refine_details.values():
+            nn.init.zeros_(conv.weight)
+            with torch.no_grad():
+                conv.weight[:, 0, 1, 1] = 1.0
+            nn.init.zeros_(conv.bias)
         # Reconstrucción Wavelet.
         self.idwt = HaarIDWT()
 
@@ -64,6 +73,9 @@ class UpBlock(nn.Module):
 
         # Recupera las bandas del encoder.
         lh, hl, hh = details
+        lh = self.refine_details["lh"](lh)
+        hl = self.refine_details["hl"](hl)
+        hh = self.refine_details["hh"](hh)
 
         # Reconstruye el siguiente nivel.
         x = self.idwt(
