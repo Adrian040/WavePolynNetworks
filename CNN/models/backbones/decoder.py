@@ -14,57 +14,6 @@ WaveletDetails = Tuple[
 ]
 
 
-# ---------------------------------------------------------
-# 1. Bloque para refinar LH, HL y HH sin borrar la subbanda
-# ---------------------------------------------------------
-class DetailRefine(nn.Module):
-
-    def __init__(
-        self,
-        channels: int
-    ) -> None:
-        super().__init__()
-
-        self.block = nn.Sequential(
-            nn.Conv2d(
-                channels,
-                channels,
-                kernel_size=3,
-                padding=1,
-                bias=False
-            ),
-            nn.GroupNorm(
-                num_groups=8,
-                num_channels=channels
-            ),
-            nn.GELU(),
-
-            nn.Conv2d(
-                channels,
-                channels,
-                kernel_size=3,
-                padding=1,
-                bias=False
-            )
-        )
-
-        # Controla cuánto modifica la subbanda original.
-        self.alpha = nn.Parameter(
-            torch.tensor(0.1)
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor
-    ) -> torch.Tensor:
-
-        # Subbanda original + corrección aprendida.
-        return x + self.alpha * self.block(x)
-
-
-# ---------------------------------------------------------
-# 2. Bloque de subida del decoder
-# ---------------------------------------------------------
 class UpBlock(nn.Module):
 
     def __init__(
@@ -74,46 +23,24 @@ class UpBlock(nn.Module):
     ) -> None:
         super().__init__()
 
-        # Procesa la LL que viene del bottleneck
-        # o del UpBlock anterior.
-        self.process_ll = nn.Sequential(
+        # Ajusta los canales de LL y normaliza sin depender del batch.
+        self.reduce_channels = nn.Sequential(
             nn.Conv2d(
                 in_channels,
                 out_channels,
-                kernel_size=3,
-                padding=1,
+                kernel_size=1,
                 bias=False
             ),
             nn.GroupNorm(
                 num_groups=8,
                 num_channels=out_channels
-            ),
-            nn.GELU()
-        )
-
-        # Procesa las subbandas del encoder.
-        self.process_lh = DetailRefine(
-            out_channels
-        )
-
-        self.process_hl = DetailRefine(
-            out_channels
-        )
-
-        self.process_hh = DetailRefine(
-            out_channels
+            )
         )
 
         # Reconstrucción Wavelet.
         self.idwt = HaarIDWT()
 
-        # Normaliza la salida reconstruida.
-        self.align_norm = nn.GroupNorm(
-            num_groups=8,
-            num_channels=out_channels
-        )
-
-        # Fusiona la IDWT con el skip.
+        # Procesa la unión entre la reconstrucción y el skip.
         self.conv = DoubleConv(
             out_channels * 2,
             out_channels
@@ -126,24 +53,18 @@ class UpBlock(nn.Module):
         details: WaveletDetails
     ) -> torch.Tensor:
 
-        # 1. Procesar LL.
-        ll = self.process_ll(x)
+        # Convierte x en la nueva banda LL.
+        x = self.reduce_channels(x)
 
-        # 2. Recuperar detalles del encoder.
+        # Recupera las bandas del encoder.
         lh, hl, hh = details
 
-        # 3. Refinar detalles conservando los originales.
-        lh = self.process_lh(lh)
-        hl = self.process_hl(hl)
-        hh = self.process_hh(hh)
-
-        # 4. Reconstrucción Wavelet.
+        # Reconstruye el siguiente nivel.
         x = self.idwt(
-            ll,
+            x,
             (lh, hl, hh)
         )
 
-        # 5. Ajustar tamaño si fuera necesario.
         if x.shape[2:] != skip.shape[2:]:
             x = F.interpolate(
                 x,
@@ -152,22 +73,15 @@ class UpBlock(nn.Module):
                 align_corners=False
             )
 
-        # 6. Normalizar reconstrucción.
-        x = self.align_norm(x)
-
-        # 7. Concatenar con skip.
+        # Une la salida reconstruida con la conexión skip.
         x = torch.cat(
             [skip, x],
             dim=1
         )
 
-        # 8. Procesar características fusionadas.
         return self.conv(x)
 
 
-# ---------------------------------------------------------
-# 3. Decoder completo
-# ---------------------------------------------------------
 class Decoder(nn.Module):
 
     def __init__(
@@ -177,13 +91,18 @@ class Decoder(nn.Module):
     ) -> None:
         super().__init__()
 
+        # Ejemplo:
+        # [64, 128, 256, 512]
+        # se convierte en:
+        # [512, 256, 128, 64]
         reversed_feats = list(
             reversed(features)
         )
 
         self.ups = nn.ModuleList()
 
-        # El bottleneck tiene el doble de canales.
+        # El bottleneck tiene el doble de canales
+        # que el último nivel del encoder.
         in_channels = reversed_feats[0] * 2
 
         for out_channels in reversed_feats:
@@ -204,7 +123,7 @@ class Decoder(nn.Module):
         wavelet_details: List[WaveletDetails]
     ) -> torch.Tensor:
 
-        # Iniciar desde el nivel más profundo.
+        # Empieza desde el nivel más profundo.
         skips = list(
             reversed(skips)
         )
@@ -213,6 +132,8 @@ class Decoder(nn.Module):
             reversed(wavelet_details)
         )
 
+        # Cada UpBlock recibe:
+        # x, skip y detalles Wavelet.
         for up, skip, details in zip(
             self.ups,
             skips,
