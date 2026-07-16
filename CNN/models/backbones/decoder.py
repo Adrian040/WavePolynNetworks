@@ -15,6 +15,7 @@ WaveletDetails = Tuple[
 
 
 class UpBlock(nn.Module):
+
     def __init__(
         self,
         in_channels: int,
@@ -22,12 +23,13 @@ class UpBlock(nn.Module):
     ) -> None:
         super().__init__()
 
-        # Ajusta los canales de LL y normaliza sin depender del batch.
-        self.reduce_channels = nn.Sequential(
+        # Procesa la LL que viene del nivel profundo.
+        self.process_ll = nn.Sequential(
             nn.Conv2d(
                 in_channels,
                 out_channels,
-                kernel_size=1,
+                kernel_size=3,
+                padding=1,
                 bias=False
             ),
             nn.GroupNorm(
@@ -36,26 +38,51 @@ class UpBlock(nn.Module):
             ),
             nn.GELU()
         )
-        self.refine_details = nn.ModuleDict({
-        "lh": nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, groups=out_channels, bias=True),
-        "hl": nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, groups=out_channels, bias=True),
-        "hh": nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, groups=out_channels, bias=True),
-        })
-        for conv in self.refine_details.values():
-            nn.init.zeros_(conv.weight)
-            with torch.no_grad():
-                conv.weight[:, 0, 1, 1] = 1.0
-            nn.init.zeros_(conv.bias)
-        # Reconstrucción Wavelet.
+
+        # Procesa cada banda de detalle.
+        self.process_lh = nn.Sequential(
+            nn.Conv2d(
+                out_channels,
+                out_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False
+            ),
+            nn.GroupNorm(8, out_channels),
+            nn.GELU()
+        )
+
+        self.process_hl = nn.Sequential(
+            nn.Conv2d(
+                out_channels,
+                out_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False
+            ),
+            nn.GroupNorm(8, out_channels),
+            nn.GELU()
+        )
+
+        self.process_hh = nn.Sequential(
+            nn.Conv2d(
+                out_channels,
+                out_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False
+            ),
+            nn.GroupNorm(8, out_channels),
+            nn.GELU()
+        )
+
         self.idwt = HaarIDWT()
 
-        # Normaliza la escala de x reconstruido para igualarla con skip.
         self.align_norm = nn.GroupNorm(
             num_groups=8,
             num_channels=out_channels
         )
 
-        # Procesa la unión entre la reconstrucción y el skip.
         self.conv = DoubleConv(
             out_channels * 2,
             out_channels
@@ -68,18 +95,19 @@ class UpBlock(nn.Module):
         details: WaveletDetails
     ) -> torch.Tensor:
 
-        # Convierte x en la nueva banda LL.
-        x = self.reduce_channels(x)
+        # Procesa la LL.
+        ll = self.process_ll(x)
 
-        # Recupera las bandas del encoder.
+        # Procesa las bandas de detalle.
         lh, hl, hh = details
-        lh = self.refine_details["lh"](lh)
-        hl = self.refine_details["hl"](hl)
-        hh = self.refine_details["hh"](hh)
 
-        # Reconstruye el siguiente nivel.
+        lh = self.process_lh(lh)
+        hl = self.process_hl(hl)
+        hh = self.process_hh(hh)
+
+        # Reconstrucción.
         x = self.idwt(
-            x,
+            ll,
             (lh, hl, hh)
         )
 
@@ -90,9 +118,9 @@ class UpBlock(nn.Module):
                 mode="bilinear",
                 align_corners=False
             )
-       
+
         x = self.align_norm(x)
-      
+
         x = torch.cat(
             [skip, x],
             dim=1
