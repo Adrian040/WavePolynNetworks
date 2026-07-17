@@ -15,6 +15,13 @@ WaveletDetails = Tuple[
 
 
 class UpBlock(nn.Module):
+    """
+    Bloque de decoder con reconstrucción Wavelet (IDWT).
+    
+    IMPORTANTE: Se usa 1x1 Conv + GroupNorm para la banda LL,
+    ya que es mucho más estable numéricamente para la IDWT
+    que usar DoubleConv con BatchNorm (evita artefactos de anillo).
+    """
 
     def __init__(
         self,
@@ -23,7 +30,8 @@ class UpBlock(nn.Module):
     ) -> None:
         super().__init__()
 
-        # Ajusta los canales de LL y normaliza sin depender del batch.
+        # Reduce los canales del bottleneck a la banda LL.
+        # Se usa GroupNorm para no depender del batch size.
         self.reduce_channels = nn.Sequential(
             nn.Conv2d(
                 in_channels,
@@ -37,7 +45,7 @@ class UpBlock(nn.Module):
             )
         )
 
-        # Reconstrucción Wavelet.
+        # Reconstrucción Wavelet (operación fija, no entrenable).
         self.idwt = HaarIDWT()
 
         # Procesa la unión entre la reconstrucción y el skip.
@@ -59,19 +67,17 @@ class UpBlock(nn.Module):
         # Recupera las bandas del encoder.
         lh, hl, hh = details
 
-        # Reconstruye el siguiente nivel.
+        # Reconstruye el siguiente nivel espacial (duplica H y W).
         x = self.idwt(
             x,
             (lh, hl, hh)
         )
 
-        if x.shape[2:] != skip.shape[2:]:
-            x = F.interpolate(
-                x,
-                size=skip.shape[2:],
-                mode="bilinear",
-                align_corners=False
-            )
+        # Verificación estricta de tamaños.
+        # Si esto falla, la DWT/IDWT tiene un problema de padding o paridad.
+        # No uses interpolación aquí porque romperías las frecuencias altas.
+        assert x.shape[2:] == skip.shape[2:], \
+            f"Shape mismatch en UpBlock: x={x.shape}, skip={skip.shape}"
 
         # Une la salida reconstruida con la conexión skip.
         x = torch.cat(
@@ -83,6 +89,9 @@ class UpBlock(nn.Module):
 
 
 class Decoder(nn.Module):
+    """
+    Decoder completo de la Wavelet U-Net.
+    """
 
     def __init__(
         self,
@@ -91,18 +100,16 @@ class Decoder(nn.Module):
     ) -> None:
         super().__init__()
 
-        # Ejemplo:
-        # [64, 128, 256, 512]
-        # se convierte en:
-        # [512, 256, 128, 64]
+        # Invertimos la lista de características para el decoder.
+        # Ejemplo: [64, 128, 256, 512] -> [512, 256, 128, 64]
         reversed_feats = list(
             reversed(features)
         )
 
         self.ups = nn.ModuleList()
 
-        # El bottleneck tiene el doble de canales
-        # que el último nivel del encoder.
+        # El bottleneck tiene el doble de canales que el último nivel del encoder.
+        # Ejemplo: features[-1] = 512 -> in_channels = 1024
         in_channels = reversed_feats[0] * 2
 
         for out_channels in reversed_feats:
@@ -114,6 +121,7 @@ class Decoder(nn.Module):
                 )
             )
 
+            # La salida de este bloque será la entrada del siguiente.
             in_channels = out_channels
 
     def forward(
@@ -123,7 +131,7 @@ class Decoder(nn.Module):
         wavelet_details: List[WaveletDetails]
     ) -> torch.Tensor:
 
-        # Empieza desde el nivel más profundo.
+        # El decoder va desde el nivel más profundo hasta el más superficial.
         skips = list(
             reversed(skips)
         )
@@ -132,8 +140,7 @@ class Decoder(nn.Module):
             reversed(wavelet_details)
         )
 
-        # Cada UpBlock recibe:
-        # x, skip y detalles Wavelet.
+        # Cada UpBlock recibe: x, skip y detalles Wavelet.
         for up, skip, details in zip(
             self.ups,
             skips,
