@@ -23,7 +23,7 @@ class UpBlock(nn.Module):
     ) -> None:
         super().__init__()
 
-        # 1. Reduce canales del bottleneck (1x1 + GroupNorm para estabilidad)
+        # Reduce canales
         self.reduce_channels = nn.Sequential(
             nn.Conv2d(
                 in_channels,
@@ -37,23 +37,21 @@ class UpBlock(nn.Module):
             )
         )
 
-        # 2. Reconstrucción Wavelet.
+        # Reconstrucción Wavelet
         self.idwt = HaarIDWT()
 
-        # 3. ¡NUEVO! Escala aprendible para controlar las frecuencias altas.
-        #    Si el ruido es mucho, el modelo aprenderá a bajar este valor (cerca de 0).
+        # Escala de detalles
         self.detail_scale = nn.Parameter(
             torch.ones(1, out_channels, 1, 1)
         )
 
-        # 4. ¡NUEVO! Normalización POST-IDWT para igualar escala con el skip.
-        #    Esto evita que la IDWT domine la concatenación.
+        # Normalización
         self.post_norm = nn.GroupNorm(
             num_groups=8,
             num_channels=out_channels
         )
 
-        # 5. Procesa la unión entre la reconstrucción y el skip.
+        # Fusión con skip
         self.conv = DoubleConv(
             out_channels * 2,
             out_channels
@@ -66,28 +64,24 @@ class UpBlock(nn.Module):
         details: WaveletDetails
     ) -> torch.Tensor:
 
-        # Prepara la banda LL
+        # Banda LL
         x = self.reduce_channels(x)
 
-        # Recupera las bandas de detalle
+        # Bandas de detalle
         lh, hl, hh = details
 
-        # --- APLICAMOS LA ESCALA A LAS FRECUENCIAS ALTAS ---
-        # Esto permite que la red "decida" cuánto detalle fino inyectar.
+        # Escala detalles
         lh = lh * self.detail_scale
         hl = hl * self.detail_scale
         hh = hh * self.detail_scale
 
-        # Reconstruye el siguiente nivel espacial (IDWT)
+        # Reconstrucción
         x = self.idwt(x, (lh, hl, hh))
 
-        # --- NORMALIZAMOS LA SALIDA DE LA IDWT ---
-        # Ahora x tendrá media ~0 y std ~1, igual que el skip.
+        # Normaliza salida
         x = self.post_norm(x)
 
-        # --- RESPALDO DE SEGURIDAD PARA DIMENSIONES ---
-        # A veces, si la imagen no es divisible por 2^n, la IDWT da 1px de menos.
-        # Lo arreglamos con interpolación SIN perder la magia de las frecuencias.
+        # Ajusta tamaño 
         if x.shape[2:] != skip.shape[2:]:
             x = F.interpolate(
                 x,
@@ -96,12 +90,11 @@ class UpBlock(nn.Module):
                 align_corners=False
             )
 
-        # Une la salida reconstruida con la conexión skip.
+        # Concatena skip
         x = torch.cat([skip, x], dim=1)
 
-        # Refina la fusión
+        # Refina salida
         return self.conv(x)
-
 
 class Decoder(nn.Module):
 
