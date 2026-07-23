@@ -4,6 +4,7 @@ from .config import UNetConfig
 from .backbones.encoder import Encoder
 from .backbones.decoder import Decoder
 from .heads.segmentation import SegmentationHead
+from .hermite.hermite_bottleneck import HermiteBottleneck
 
 
 class UNet(nn.Module):
@@ -15,6 +16,12 @@ class UNet(nn.Module):
             in_channels=self.config.in_channels,   # Canales de entrada.
             features=self.config.features,         # Filtros por cada nivel.
         )
+        self.hermite = HermiteBottleneck(
+        channels=self.config.features[-1] * 2,
+        hidden_channels=self.config.features[-1],
+        kernel_size=5,
+        sigma=1.0,
+      )   
 
         self.decoder = Decoder(
         features=self.config.features
@@ -29,6 +36,7 @@ class UNet(nn.Module):
    # Flujo principal del modelo U-Net
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x, skips, wavelet_details = self.encoder(x)
+        x = self.hermite(x)
 
         x = self.decoder(
             x,
@@ -48,6 +56,10 @@ class UNet(nn.Module):
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.GroupNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
