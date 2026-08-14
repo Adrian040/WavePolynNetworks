@@ -80,18 +80,24 @@ class TestCore(unittest.TestCase):
     def test_all_matlab_modules_have_python_counterpart(self):
         expected = {
             "angshow", "bincoef", "binpyr", "binpyr2", "bsmooth", "bsmooth2", "bt2dht", "chtmtx",
-            "clssplot", "Contents", "ddht", "dht", "dht2", "dht2_test", "dht2bt", "dht3", "dhtentr",
+            "clssplot", "Contents", "ddht", "dht", "dht2", "dht2bt", "dht3", "dhtentr",
             "dhtgi", "dhti", "dhti2", "dhtJ", "dhtmorph", "dhtmtx", "dhtord", "dhtqt", "dhtshow",
             "dob2", "edht", "energy", "equaliz", "fbt", "fbt2", "fbt3", "fbtmtx", "gauge", "gbtmtx",
             "grafica", "graficaMapCoefs", "guidht", "hermite", "hermiteFiltersFreq", "idht", "idht2", "idht3",
             "idhtqt", "im2qtb", "imcorn", "imdht", "imdht2", "lorient", "matshow", "mddht2", "mdht",
             "mdht2", "mdhti", "mdhti2", "mgauge", "mrdht", "mrdht2", "mscode", "obtainOrdCoefs",
-            "overshoot", "pdht", "pred_test", "qdht", "qtb2im", "qtplot", "rdht", "rdht2", "rot_test",
+            "overshoot", "pdht", "qdht", "qtb2im", "qtplot", "rdht", "rdht2",
             "samplat", "sdht2", "xdht2", "zcross",
         }
         folder = Path(dhts.__file__).parent
         actual = {path.stem for path in folder.glob("*.py") if not path.stem.startswith("_")}
         self.assertTrue(expected.issubset(actual), expected-actual)
+
+        # MATLAB scripts whose purpose is testing belong under dhts_py/tests.
+        scripts = {path.stem for path in (folder / "tests").glob("test_*.py")}
+        self.assertTrue(
+            {"test_dht2_reconstruction", "test_prediction", "test_rotation"}.issubset(scripts)
+        )
 
 
 if __name__ == "__main__":

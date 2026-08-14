@@ -1,32 +1,75 @@
-# Notas de migración y trazabilidad
+# Notas de port y diferencias verificables
 
-## Criterio numérico
+Este archivo registra únicamente diferencias reales entre el MATLAB
+suministrado y Python, erratas del material y dependencias ausentes. Los tests
+internos no se presentan como evidencia de equivalencia MATLAB.
 
-El núcleo no usa aproximaciones Hermite continuas: construye los mismos filtros binomiales/Krawtchouk por convoluciones sucesivas y aplica la normalización de `dhtmtx.m`. La síntesis conserva la interpolación especial para `T<=2` y el cálculo general de pesos para `T>2`. `rdht` implementa la recurrencia normalizada del original, no una matriz de rotación genérica.
+## Erratas de nombres o ejecución ya presentes en MATLAB
 
-## Erratas inequívocas reparadas
+- `gbtmtx.m` declara una función llamada `dhtmtx`; Python exporta `gbtmtx`.
+- `bsmooth2.m` declara `bsmooth`; Python exporta `bsmooth2`.
+- `mddht2.m` declara `mrdht2`; Python exporta `mddht2` y aplica `ddht`, que es
+  la intención indicada por el nombre del archivo.
+- `guidht.m` declara `guidhtq`; Python conserva los alias `guidht` y
+  `guidhtq`.
+- `dhti.m` escribe `sumpot` pero usa `sumopt`.
+- `mgauge.m` referencia `Y` aunque el argumento se llama `y`.
+- `lorient.m` llama `mdhti2` sin el argumento `xsiz`.
 
-- `gbtmtx.m` declaraba por error una función llamada `dhtmtx`; el módulo Python exporta `gbtmtx`.
-- `bsmooth2.m` declaraba `bsmooth`; el módulo Python exporta `bsmooth2`.
-- `mddht2.m` declaraba `mrdht2`; el módulo Python exporta `mddht2` y aplica `ddht`, que es la intención del archivo.
-- `guidht.m` declaraba `guidhtq`; se exportan ambos nombres, `guidht` y `guidhtq`.
-- `dht.m` contenía modificaciones `JOM` que accedían a `dim` antes de asignar su valor por defecto y luego lo reemplazaban por todos los ejes no unitarios. Se restauró el comportamiento descrito en la cabecera: primer eje no unitario o el `dim` indicado.
-- `dhti.m` escribía `sumpot` pero usaba `sumopt`; se corrigió a `sumopt`.
-- `mgauge.m` referenciaba `Y` aunque el argumento se llamaba `y`; el port usa el argumento recibido.
-- `lorient.m` llamaba `mdhti2` sin `xsiz`; el port pasa el tamaño de la imagen.
-- `imcorn.m` dependía de la interpretación multibanda de un arreglo de productos; el port suaviza cada producto explícitamente y conserva la fórmula de respuesta.
+## Divergencias matemáticas preexistentes pendientes de decisión
 
-## Decisiones de interfaz
+No se modificaron durante esta refactorización.
 
-Python no tiene `nargout`. Las funciones con salidas opcionales usan banderas explícitas (`return_lowpass`, `return_theta`, `return_aux`, `return_bounds`). Los argumentos posicionales al estilo MATLAB siguen aceptándose en los casos principales, incluidos `shape` seguido de código de postproceso.
+### `gauge` cuando `L > N`
 
-La GUI GUIDE de 1500 líneas no es portable fuera de MATLAB. `guidht.py` proporciona un explorador Matplotlib funcional con imagen, coeficientes, reconstrucción y controles `N/D/T`; el núcleo numérico que utiliza sí es el mismo del paquete.
+En la rama inferior a la antidiagonal, `gauge.m` construye un bloque de grado
+`nn=N-n`, pero divide `atan2(a,b)` por el contador `n`. `gauge.py` divide por
+el grado efectivo del bloque (`nn`). Para las validaciones pedidas (`N=8`,
+`D=3`, `L=1`) esta rama no se usa; para `D>N` puede producir ángulos distintos.
+Se requiere decisión explícita antes de cambiar uno de los comportamientos.
 
-## Datos externos no entregados
+### `dhtord`/`dht3` con `D > N`
 
-`pdcentr.mat` y `scest.mat` no estaban en el directorio suministrado. No se inventaron coeficientes entrenados. La clasificación perceptual tiene un reemplazo determinista; la estimación opcional de `zcross` exige que el usuario suministre el modelo. También faltaban `nei2band`, `vquant`/`vquantiz` y `normalize01`; sus operaciones necesarias se implementaron localmente.
+`dhtord.m` permite que la tercera coordenada llegue hasta `D`, mientras
+`dhtmtx.m` sólo produce filtros hasta `N`; por ello `dht3.m` puede intentar
+indexar una columna inexistente cuando `D>N`. Python limita cada orden por eje
+y permite la base 3‑D completa. El roundtrip 3‑D actual es una prueba interna
+Python, no una equivalencia validada contra MATLAB.
 
-## Precisión y bordes
+### Selección de `dim` en `dht.m`
 
-Para `shape="full"` y base completa, las pruebas exigen reconstrucción con error máximo menor que `1e-12`. Los modos recortados (`same`, `valid`) y los modos que sólo prolongan el coeficiente de orden cero en la síntesis reproducen la pérdida de información de borde del algoritmo original y no prometen reconstrucción perfecta en el contorno.
+El archivo suministrado contiene líneas marcadas `JOM` que leen `dim` antes de
+establecer el valor por defecto y después lo reemplazan por todos los ejes no
+unitarios. Python conserva la interfaz descrita en la cabecera: usa el `dim`
+solicitado o el primer eje no unitario. Esta diferencia de control de ejes no
+se cambió en esta tarea.
 
+## Datos externos no suministrados
+
+- `sdht2.m` requiere `pdcentr.mat` y funciones de cuantización ausentes. La
+  rama adaptativa Python contiene un fallback determinista preexistente; no es
+  evidencia de equivalencia y debe considerarse pendiente hasta disponer de
+  esos datos.
+- `zcross.m` requiere `scest.mat` para escala/contraste. Python exige pasar el
+  modelo mediante `scale_model=`; no inventa sus coeficientes.
+- También faltan `nei2band`, `vquant`/`vquantiz` y `normalize01`; sólo las
+  operaciones necesarias para las rutas disponibles se implementaron
+  localmente.
+
+## Diferencias inevitables de interfaz
+
+Python no tiene `nargout`. Las salidas opcionales usan `return_lowpass`,
+`return_theta`, `return_aux` y `return_bounds`. Los canales ocupan el último
+eje NumPy y todos los cálculos científicos se conservan en `float64`.
+
+La GUI MATLAB GUIDE de aproximadamente 1500 líneas no es portable sin GUIDE.
+`guidht.py` ofrece un explorador Matplotlib de carga, transformación,
+coeficientes y reconstrucción; no pretende reproducir la interfaz gráfica.
+
+## Estado de equivalencia
+
+En este entorno no se encontró MATLAB ni GNU Octave y no se entregaron arrays
+MATLAB (`.mat`/CSV) para las diez comparaciones. La suite de equivalencia queda
+preparada y se marca `PENDING MATLAB REFERENCE` hasta ejecutar
+`tests/matlab/generate_matlab_references.m`. Los PNG y la tabla de métricas ya
+existentes no se usan como referencia numérica de coeficientes.

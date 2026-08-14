@@ -1,17 +1,24 @@
 """Python version of the multiscale prediction experiment pred_test.m."""
 
 from pathlib import Path
+import sys
 
 import numpy as np
 from PIL import Image
 
-from .mdht2 import mdht2
-from .pdht import pdht
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from dhts_py.mdht2 import mdht2
+from dhts_py.pdht import pdht
+
+
+PACKAGE_DIR = Path(__file__).resolve().parents[1]
 
 
 def run_pred_test(image=None, N0: int = 8, D: int = 12, M: int = 4, level: int = 2):
     if image is None:
-        image = Path(__file__).with_name("lena.jpg")
+        image = PACKAGE_DIR / "lena.jpg"
     if isinstance(image, (str, Path)):
         X = np.asarray(Image.open(image).convert("L"), dtype=float) / 255
     else:
@@ -31,4 +38,3 @@ def run_pred_test(image=None, N0: int = 8, D: int = 12, M: int = 4, level: int =
 if __name__ == "__main__":
     _, _, snr = run_pred_test()
     print("prediction SNR by channel:", snr)
-

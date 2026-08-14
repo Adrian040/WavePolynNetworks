@@ -1,9 +1,15 @@
 """Python version of rot_test.m."""
 
+import sys
+from pathlib import Path
+
 import numpy as np
 from scipy.ndimage import rotate
 
-from .dht2 import dht2
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from dhts_py.dht2 import dht2
 
 
 def run_rot_test(N: int = 8, angle_degrees: float = 30.0):
@@ -20,4 +26,3 @@ def run_rot_test(N: int = 8, angle_degrees: float = 30.0):
 if __name__ == "__main__":
     coefs, theta = run_rot_test()
     print("coefficients:", coefs.shape, "mean theta (deg):", np.degrees(np.mean(theta)))
-

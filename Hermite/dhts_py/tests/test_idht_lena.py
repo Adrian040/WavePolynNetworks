@@ -27,11 +27,14 @@ import numpy as np
 # Admite tanto ``python -m dhts_py.test_idht_lena`` como la ejecución directa
 # ``python dhts_py/test_idht_lena.py`` desde cualquier directorio.
 if __package__ in {None, ""}:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from dhts_py.dht2 import dht2
 from dhts_py.idht2 import idht2
-from dhts_py.test_dht2_lena import cargar_imagen_matlab
+from dhts_py.tests.test_dht2_lena import PACKAGE_DIR, RESULTS_ROOT, cargar_imagen_matlab
+
+
+DEFAULT_RESULTS_DIR = Path(__file__).resolve().parent / "resultados" / "idht"
 
 
 def _mostrar_como_matlab(eje, imagen: np.ndarray, titulo: str) -> None:
@@ -48,7 +51,7 @@ def ejecutar_prueba_idht(
     N: int = 8,
     D: int = 2,
     T: int = 2,
-    guardar_en: str | Path | None = None,
+    guardar_en: str | Path | None = DEFAULT_RESULTS_DIR,
     mostrar: bool = True,
 ):
     """Ejecuta las transformadas y reconstrucciones del script MATLAB.
@@ -75,7 +78,7 @@ def ejecutar_prueba_idht(
     plt.close("all")  # Equivalente a close all.
 
     if ruta_imagen is None:
-        ruta_imagen = Path(__file__).with_name("lena.jpg")
+        ruta_imagen = PACKAGE_DIR / "lena.jpg"
     ruta_imagen = Path(ruta_imagen).expanduser().resolve()
     if not ruta_imagen.is_file():
         raise FileNotFoundError(f"No se encontró la imagen: {ruta_imagen}")
@@ -113,6 +116,8 @@ def ejecutar_prueba_idht(
 
     if guardar_en is not None:
         carpeta = Path(guardar_en).expanduser().resolve()
+        if carpeta != RESULTS_ROOT.resolve() and RESULTS_ROOT.resolve() not in carpeta.parents:
+            raise ValueError("Los resultados de tests deben guardarse dentro de dhts_py/tests/resultados")
         carpeta.mkdir(parents=True, exist_ok=True)
         figura.savefig(carpeta / "comparativa_reconstruccion.png", dpi=150, bbox_inches="tight")
         np.savez_compressed(
@@ -152,13 +157,14 @@ def _argumentos() -> argparse.Namespace:
     parser.add_argument(
         "--image",
         type=Path,
-        default=Path(__file__).with_name("lena.jpg"),
+        default=PACKAGE_DIR / "lena.jpg",
         help="Imagen de entrada (por defecto, dhts_py/lena.jpg).",
     )
     parser.add_argument(
         "--save-dir",
         type=Path,
-        help="Carpeta opcional para guardar la figura y resultados_idht_lena.npz.",
+        default=DEFAULT_RESULTS_DIR,
+        help="Carpeta de salida (por defecto, tests/resultados/idht).",
     )
     parser.add_argument("--no-show", action="store_true", help="No abre la ventana de Matplotlib.")
     return parser.parse_args()
@@ -171,4 +177,3 @@ if __name__ == "__main__":
         guardar_en=argumentos.save_dir,
         mostrar=not argumentos.no_show,
     )
-
