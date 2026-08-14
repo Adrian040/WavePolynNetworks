@@ -1,41 +1,36 @@
-"""Hermite transform, steering, inverse steering and image reconstruction.
+"""Transformada de Hermite 2-D con funciones Hermite--Gaussianas.
 
-This implementation keeps the continuous Hermite-Gaussian approach of the
-original Python script, but corrects the main consistency issues:
+El modulo implementa analisis cartesiano, estimacion de orientacion,
+``steering``, ``steering`` inverso y sintesis de una expansion local
+truncada. Los filtros tienen soporte finito, impar y seleccionado
+automaticamente; son productos separables de polinomios de Hermite
+normalizados y una ventana Gaussiana.
 
-1. Analysis, steering, inverse steering and synthesis are separate functions.
-2. Steering uses the normalized recurrence used by the MATLAB RDHT toolbox.
-3. The dominant gradient angle is kept in [-pi, pi] (no modulo-pi reduction).
-4. The angle is returned separately; no coefficient channel is overwritten.
-5. Reconstruction uses discrete dual synthesis filters computed from the
-   sampled analysis filters. With the full square basis and
-   kernel_size == max_order + 1, the local transform is complete and the
-   reconstruction is numerically exact, up to floating-point precision.
-6. All requested stages can be selected from hermite_transform_image().
-
-The full-square exact mode is a hybrid: the analysis filters are sampled
-continuous Hermite-Gaussian functions, while the separate dual synthesis
-filters follow the same analysis/synthesis philosophy as the MATLAB toolbox.
+La primera componente de un orden ``(m, n)`` corresponde al eje horizontal
+``x`` (columnas), y la segunda al eje vertical ``y`` (filas).
 """
 
 from __future__ import annotations
 
 import csv
+import warnings
 from math import comb
 from pathlib import Path
-from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
+from typing import Dict, Mapping, Optional, Sequence, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
-from scipy.signal import convolve2d
+from scipy.ndimage import convolve1d, correlate1d
 from scipy.special import eval_hermite, gammaln
-from numpy.lib.stride_tricks import sliding_window_view
 
 Array = np.ndarray
 Order = Tuple[int, int]
 CoeffDict = Dict[Order, Array]
 PathLike = Union[str, Path]
+
+_SUPPORT_TOLERANCE = 1e-8
+_TAIL_SAMPLES = 3
 
 
 # -----------------------------------------------------------------------------
@@ -44,39 +39,56 @@ PathLike = Union[str, Path]
 
 
 def read_image(image: Union[PathLike, Image.Image, Array], dtype=np.float64) -> Array:
-    """Read an image as a two-dimensional grayscale array in [0, 1]."""
+    """Read an image as a two-dimensional grayscale array.
+
+    Parameters
+    ----------
+    image : path-like, PIL.Image.Image or ndarray
+        Input image. RGB arrays are converted with standard luminance weights.
+    dtype : numpy dtype, default=float64
+        Output dtype.
+
+    Returns
+    -------
+    image_array : ndarray
+        Two-dimensional image in its original numeric scale.
+
+    Notes
+    -----
+    Integer images are converted to floating point without rescaling. In
+    particular, an 8-bit file remains in the range ``0..255``.
+    """
     if isinstance(image, (str, Path)):
         with Image.open(image) as pil_image:
-            img = np.asarray(pil_image.convert("L"), dtype=dtype)
+            result = np.asarray(pil_image.convert("L"), dtype=dtype)
     elif isinstance(image, Image.Image):
-        img = np.asarray(image.convert("L"), dtype=dtype)
+        result = np.asarray(image.convert("L"), dtype=dtype)
     else:
-        img = np.asarray(image)
-        if img.ndim == 3:
-            if img.shape[-1] >= 3:
-                # Standard luminance conversion instead of a simple channel mean.
-                rgb = img[..., :3].astype(dtype)
-                img = 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
-            elif img.shape[-1] == 2:
-                # Grayscale + alpha: keep the grayscale channel.
-                img = img[..., 0]
+        result = np.asarray(image)
+        if result.ndim == 3:
+            if result.shape[-1] >= 3:
+                rgb = result[..., :3].astype(dtype)
+                result = (
+                    0.2126 * rgb[..., 0]
+                    + 0.7152 * rgb[..., 1]
+                    + 0.0722 * rgb[..., 2]
+                )
+            elif result.shape[-1] == 2:
+                result = result[..., 0]
             else:
-                img = np.squeeze(img, axis=-1)
-        if img.ndim != 2:
-            raise ValueError(f"The input image must be 2-D after conversion; got shape {img.shape}.")
-        img = img.astype(dtype, copy=False)
+                result = np.squeeze(result, axis=-1)
+        if result.ndim != 2:
+            raise ValueError(
+                "The input image must be 2-D after conversion; "
+                f"got shape {result.shape}."
+            )
+        result = result.astype(dtype, copy=False)
 
-    if img.size == 0:
+    if result.size == 0:
         raise ValueError("The input image is empty.")
-
-    max_value = float(np.nanmax(img))
-    if max_value > 1.5:
-        img = img / 255.0
-
-    if not np.isfinite(img).all():
+    if not np.isfinite(result).all():
         raise ValueError("The input image contains NaN or infinite values.")
-
-    return img.astype(dtype, copy=False)
+    return result.astype(dtype, copy=False)
 
 
 def _ensure_parent(path: Optional[PathLike]) -> Optional[Path]:
@@ -87,193 +99,297 @@ def _ensure_parent(path: Optional[PathLike]) -> Optional[Path]:
     return output
 
 
+def _nonnegative_integer(name: str, value: int) -> int:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, np.integer)
+    ):
+        raise ValueError(f"{name} must be a non-negative integer.")
+    result = int(value)
+    if result < 0:
+        raise ValueError(f"{name} must be a non-negative integer.")
+    return result
+
+
 # -----------------------------------------------------------------------------
-# Orders and filter construction
+# Orders and Hermite--Gaussian filter bank
 # -----------------------------------------------------------------------------
 
 
-def hermite_orders(max_order: int, coefficient_region: str = "triangle") -> Sequence[Order]:
-    """Return coefficient orders in the same anti-diagonal order as MATLAB DHTORD.
+def hermite_orders(max_order: int, coefficient_region: str = "triangle") -> list[Order]:
+    """Return coefficient orders grouped by total degree.
 
     Parameters
     ----------
-    max_order:
-        In ``triangle`` mode, it is the maximum total order m+n.
-        In ``square`` mode, it is the maximum order on each axis.
-    coefficient_region:
-        ``triangle`` -> m+n <= max_order.
-        ``square``   -> 0 <= m,n <= max_order.
-    """
-    if not isinstance(max_order, (int, np.integer)) or max_order < 0:
-        raise ValueError("max_order must be a non-negative integer.")
+    max_order : int
+        Maximum total order for ``triangle`` or maximum order on each axis for
+        ``square``.
+    coefficient_region : {"triangle", "square"}, default="triangle"
+        Region of coefficient pairs.
 
+    Returns
+    -------
+    orders : list of tuple of int
+        Channel order ``L00, L10, L01, L20, L11, L02, ...``. Within a total
+        degree, ``m`` decreases and ``n`` increases.
+    """
+    limit = _nonnegative_integer("max_order", max_order)
+    if not isinstance(coefficient_region, str):
+        raise ValueError("coefficient_region must be 'triangle' or 'square'.")
     region = coefficient_region.lower()
-    if region == "triangle":
-        n_scale = max_order
-        max_total = max_order
-    elif region == "square":
-        n_scale = max_order
-        max_total = 2 * max_order
-    else:
+    if region not in {"triangle", "square"}:
         raise ValueError("coefficient_region must be 'triangle' or 'square'.")
 
-    orders = []
+    max_total = limit if region == "triangle" else 2 * limit
+    orders: list[Order] = []
     for total in range(max_total + 1):
-        m_min = max(0, total - n_scale)
-        m_max = min(n_scale, total)
-        for m in range(m_min, m_max + 1):
-            orders.append((m, total - m))
+        largest_m = total if region == "triangle" else min(limit, total)
+        smallest_m = 0 if region == "triangle" else max(0, total - limit)
+        orders.extend(
+            (m, total - m)
+            for m in range(largest_m, smallest_m - 1, -1)
+        )
     return orders
 
 
 def _hermite_normalization(order: int) -> float:
-    """Return 1/sqrt(2^n n!) without overflowing for moderate orders."""
-    return float(np.exp(-0.5 * (order * np.log(2.0) + gammaln(order + 1.0))))
+    """Return ``1 / sqrt(2**n * n!)`` without factorial overflow."""
+    return float(
+        np.exp(-0.5 * (order * np.log(2.0) + gammaln(order + 1.0)))
+    )
+
+
+def _analysis_filter_values(order: int, coordinates: Array, sigma: float) -> Array:
+    """Evaluate the normalized one-dimensional analysis function."""
+    scaled = np.asarray(coordinates, dtype=np.float64) / sigma
+    gaussian = np.exp(-(scaled**2)) / (sigma * np.sqrt(np.pi))
+    polynomial = _hermite_normalization(order) * eval_hermite(order, scaled)
+    return np.asarray(polynomial * gaussian, dtype=np.float64)
+
+
+def _select_support_radius(
+    sigma: float,
+    max_order: int,
+    tolerance: float = _SUPPORT_TOLERANCE,
+    tail_samples: int = _TAIL_SAMPLES,
+) -> int:
+    """Select an odd, symmetric finite support for all required 1-D filters.
+
+    The search starts beyond both four Gaussian scales and the approximate
+    turning point of the highest Hermite polynomial. A radius is accepted only
+    when ``tail_samples`` consecutive non-negative samples of every filter are
+    smaller than ``tolerance`` times that filter's sampled maximum.
+    """
+    if not np.isfinite(sigma) or sigma <= 0.0:
+        raise ValueError("sigma must be a finite positive number.")
+    highest = _nonnegative_integer("max_order", max_order)
+    if not np.isfinite(tolerance) or not 0.0 < tolerance < 1.0:
+        raise ValueError("tolerance must be between zero and one.")
+    if not isinstance(tail_samples, (int, np.integer)) or tail_samples < 1:
+        raise ValueError("tail_samples must be a positive integer.")
+
+    start_scale = max(4.0, np.sqrt(2.0 * highest + 1.0) + 2.0)
+    radius = max(1, int(np.ceil(sigma * start_scale)))
+    maximum_radius = max(radius + 1000, int(np.ceil(50.0 * sigma)) + highest)
+
+    while radius <= maximum_radius:
+        coordinates = np.arange(radius + tail_samples, dtype=np.float64)
+        tails_are_small = True
+        for order in range(highest + 1):
+            values = np.abs(_analysis_filter_values(order, coordinates, sigma))
+            peak = float(np.max(values))
+            if peak == 0.0 or not np.all(values[radius:] / peak < tolerance):
+                tails_are_small = False
+                break
+        if tails_are_small:
+            return radius
+        radius += 1
+
+    raise RuntimeError(
+        "Could not select a finite Hermite--Gaussian support for the requested "
+        "sigma and order."
+    )
+
+
+def build_hermite_gaussian_filter_bank(
+    max_order: int = 3,
+    sigma: float = 2.0,
+    coefficient_region: str = "square",
+    dtype=np.float64,
+) -> dict:
+    """Build a finite-support Hermite--Gaussian analysis filter bank.
+
+    Parameters
+    ----------
+    max_order : int, default=3
+        Maximum total order in ``triangle`` mode or maximum order on each axis
+        in ``square`` mode.
+    sigma : float, default=2.0
+        Gaussian scale in pixels.
+    coefficient_region : {"triangle", "square"}, default="square"
+        Public coefficient region.
+    dtype : numpy dtype, default=float64
+        Storage dtype. The filters are evaluated in ``float64`` first.
+
+    Returns
+    -------
+    filter_bank : dict
+        Contains public ``orders``, complete ``steering_orders``, 1-D and 2-D
+        analysis filters, the Gaussian ``window_squared``, automatic support
+        information and numerical diagnostics.
+
+    Notes
+    -----
+    For ``square`` the bank also contains the complete triangular set through
+    total order ``2*max_order``. Those auxiliary channels make every steering
+    block complete; the public output remains square.
+    """
+    limit = _nonnegative_integer("max_order", max_order)
+    if not np.isfinite(sigma) or sigma <= 0.0:
+        raise ValueError("sigma must be a finite positive number.")
+    sigma = float(sigma)
+    public_orders = list(hermite_orders(limit, coefficient_region))
+    region = coefficient_region.lower()
+    steering_orders = (
+        list(hermite_orders(2 * limit, "triangle"))
+        if region == "square"
+        else public_orders.copy()
+    )
+    highest_axis_order = max(
+        (max(m, n) for m, n in steering_orders), default=0
+    )
+    support_radius = _select_support_radius(sigma, highest_axis_order)
+    coordinates = np.arange(
+        -support_radius, support_radius + 1, dtype=np.float64
+    )
+
+    filters_1d = {
+        order: _analysis_filter_values(order, coordinates, sigma).astype(
+            dtype, copy=False
+        )
+        for order in range(highest_axis_order + 1)
+    }
+    analysis_filters: CoeffDict = {
+        (m, n): np.outer(filters_1d[n], filters_1d[m]).astype(dtype, copy=False)
+        for m, n in steering_orders
+    }
+    window_squared = np.outer(filters_1d[0], filters_1d[0]).astype(
+        dtype, copy=False
+    )
+
+    dc_leakage: dict[int, float] = {}
+    diagnostics: dict[int, dict[str, float]] = {}
+    dc_reference = max(abs(float(np.sum(filters_1d[0]))), np.finfo(float).eps)
+    for order, values in filters_1d.items():
+        values64 = np.asarray(values, dtype=np.float64)
+        peak = max(float(np.max(np.abs(values64))), np.finfo(float).tiny)
+        signed_sum = float(np.sum(values64))
+        parity_error = float(
+            np.max(np.abs(values64 - ((-1) ** order) * values64[::-1]))
+        )
+        edge_ratio = float(
+            max(abs(values64[0]), abs(values64[-1])) / peak
+        )
+        relative_dc = abs(signed_sum) / dc_reference
+        dc_leakage[order] = signed_sum
+        diagnostics[order] = {
+            "sum": signed_sum,
+            "relative_dc_leakage": float(relative_dc),
+            "parity_max_abs_error": parity_error,
+            "edge_relative_magnitude": edge_ratio,
+        }
+
+    problematic = [
+        order
+        for order in range(1, highest_axis_order + 1)
+        if diagnostics[order]["relative_dc_leakage"] > 1e-3
+    ]
+    if problematic:
+        warnings.warn(
+            "The sampled Hermite--Gaussian filters have appreciable DC "
+            f"leakage at orders {problematic}. Consider a larger sigma relative "
+            "to the pixel spacing.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    return {
+        "sigma": sigma,
+        "support_radius": support_radius,
+        "kernel_size": 2 * support_radius + 1,
+        "coordinates": coordinates.astype(dtype, copy=False),
+        "orders": public_orders,
+        "steering_orders": steering_orders,
+        "analysis_orders": steering_orders,
+        "analysis_filters_1d": filters_1d,
+        "analysis_filters": analysis_filters,
+        "window": np.sqrt(window_squared).astype(dtype, copy=False),
+        "window_squared": window_squared,
+        "dc_leakage": dc_leakage,
+        "diagnostics": diagnostics,
+        "tail_tolerance": _SUPPORT_TOLERANCE,
+        "tail_samples": _TAIL_SAMPLES,
+        "coefficient_region": region,
+        "max_order": limit,
+    }
 
 
 def build_hermite_filter_bank(
     max_order: int = 3,
     sigma: float = 2.0,
-    kernel_size: Optional[int] = None,
     coefficient_region: str = "square",
-    exact_reconstruction: bool = True,
-    rcond: float = 1e-12,
     dtype=np.float64,
 ) -> dict:
-    """Build sampled Hermite-Gaussian analysis filters and their discrete duals.
-
-    The analysis filter is
-
-        D_mn(x,y) = G_mn(x,y) * w(x,y)^2,
-
-    where G_mn contains the normalized physicists' Hermite polynomials and
-    w is an isotropic Gaussian window.
-
-    The synthesis filters are the discrete dual basis obtained from the
-    pseudoinverse of the sampled analysis operator. In full-square mode with
-    ``kernel_size == max_order + 1``, the operator is square and full-rank,
-    yielding numerical perfect reconstruction of every local patch.
-    """
-    if sigma <= 0:
-        raise ValueError("sigma must be positive.")
-    if rcond <= 0:
-        raise ValueError("rcond must be positive.")
-
-    region = coefficient_region.lower()
-    orders = list(hermite_orders(max_order, region))
-
-    if exact_reconstruction:
-        if region != "square":
-            raise ValueError(
-                "exact_reconstruction=True requires coefficient_region='square'."
-            )
-        required_kernel = max_order + 1
-        if kernel_size is None:
-            kernel_size = required_kernel
-        elif kernel_size != required_kernel:
-            raise ValueError(
-                "For exact reconstruction with the continuous sampled basis, "
-                f"kernel_size must equal max_order + 1 = {required_kernel}."
-            )
-    elif kernel_size is None:
-        kernel_size = int(2 * np.ceil(3.0 * sigma) + 1)
-
-    if not isinstance(kernel_size, (int, np.integer)) or kernel_size <= 0:
-        raise ValueError("kernel_size must be a positive integer.")
-
-    # Half-integer coordinates are allowed for an even-size kernel, matching
-    # the N+1 support convention of the MATLAB discrete transform.
-    coords = np.arange(kernel_size, dtype=dtype) - (kernel_size - 1.0) / 2.0
-    x_scaled = coords / float(sigma)
-
-    max_axis_order = max(max(m, n) for m, n in orders) if orders else 0
-    hermite_1d = {}
-    for order in range(max_axis_order + 1):
-        hermite_1d[order] = (
-            _hermite_normalization(order) * eval_hermite(order, x_scaled)
-        ).astype(dtype)
-
-    yy, xx = np.meshgrid(x_scaled, x_scaled, indexing="ij")
-    window = np.exp(-0.5 * (xx**2 + yy**2)).astype(dtype)
-    window_squared = (window**2).astype(dtype)
-
-    analysis_filters: CoeffDict = {}
-    for m, n in orders:
-        # First index m is the x order; second index n is the y order.
-        polynomial = np.outer(hermite_1d[n], hermite_1d[m]).astype(dtype)
-        analysis_filters[(m, n)] = (polynomial * window_squared).astype(dtype)
-
-    analysis_matrix = np.column_stack(
-        [analysis_filters[order].reshape(-1) for order in orders]
-    ).astype(dtype)
-
-    # c = A^T p, therefore p = pinv(A^T)c.
-    synthesis_matrix = np.linalg.pinv(analysis_matrix.T, rcond=rcond).astype(dtype)
-    synthesis_filters: CoeffDict = {
-        order: synthesis_matrix[:, index].reshape(kernel_size, kernel_size)
-        for index, order in enumerate(orders)
-    }
-
-    rank = int(np.linalg.matrix_rank(analysis_matrix, tol=rcond))
-    condition_number = float(np.linalg.cond(analysis_matrix))
-    patch_dimension = kernel_size * kernel_size
-    is_complete = len(orders) == patch_dimension and rank == patch_dimension
-
-    if exact_reconstruction and not is_complete:
-        raise np.linalg.LinAlgError(
-            "The sampled Hermite analysis matrix is not full rank; exact "
-            "reconstruction cannot be guaranteed with these parameters."
-        )
-
-    return {
-        "orders": orders,
-        "analysis_filters": analysis_filters,
-        "synthesis_filters": synthesis_filters,
-        "window": window,
-        "window_squared": window_squared,
-        "analysis_matrix": analysis_matrix,
-        "synthesis_matrix": synthesis_matrix,
-        "kernel_size": int(kernel_size),
-        "sigma": float(sigma),
-        "rank": rank,
-        "condition_number": condition_number,
-        "is_complete": is_complete,
-        "coefficient_region": region,
-        "max_order": int(max_order),
-    }
-
-
-# -----------------------------------------------------------------------------
-# Cartesian forward transform and inverse transform
-# -----------------------------------------------------------------------------
-
-
-def _padding_for_kernel(kernel_size: int) -> Tuple[int, int, int, int]:
-    top = kernel_size // 2
-    bottom = kernel_size - 1 - top
-    left = kernel_size // 2
-    right = kernel_size - 1 - left
-    return top, bottom, left, right
-
-
-def _pad_image(image: Array, pads: Tuple[int, int, int, int], boundary: str) -> Array:
-    top, bottom, left, right = pads
-    boundary = boundary.lower()
-    pad_width = ((top, bottom), (left, right))
-
-    if boundary in {"reflect", "symm", "symmetric"}:
-        # np.pad('symmetric') repeats the edge sample and is closest to
-        # scipy.signal boundary='symm'.
-        return np.pad(image, pad_width, mode="symmetric")
-    if boundary in {"constant", "fill", "zero"}:
-        return np.pad(image, pad_width, mode="constant", constant_values=0.0)
-    if boundary in {"edge", "replicate"}:
-        return np.pad(image, pad_width, mode="edge")
-    if boundary in {"wrap", "circular"}:
-        return np.pad(image, pad_width, mode="wrap")
-    raise ValueError(
-        "boundary must be one of: 'symmetric', 'constant', 'edge', or 'wrap'."
+    """Compatibility name for :func:`build_hermite_gaussian_filter_bank`."""
+    return build_hermite_gaussian_filter_bank(
+        max_order=max_order,
+        sigma=sigma,
+        coefficient_region=coefficient_region,
+        dtype=dtype,
     )
+
+
+# -----------------------------------------------------------------------------
+# Cartesian analysis and frame synthesis
+# -----------------------------------------------------------------------------
+
+
+def _normalize_boundary(boundary: str) -> str:
+    if not isinstance(boundary, str):
+        raise ValueError(
+            "boundary must be one of: 'symmetric', 'constant', 'edge', or 'wrap'."
+        )
+    aliases = {
+        "reflect": "symmetric",
+        "symm": "symmetric",
+        "symmetric": "symmetric",
+        "constant": "constant",
+        "fill": "constant",
+        "zero": "constant",
+        "edge": "edge",
+        "replicate": "edge",
+        "wrap": "wrap",
+        "circular": "wrap",
+    }
+    try:
+        return aliases[boundary.lower()]
+    except KeyError as exc:
+        raise ValueError(
+            "boundary must be one of: 'symmetric', 'constant', 'edge', or 'wrap'."
+        ) from exc
+
+
+def _ndimage_boundary(boundary: str) -> str:
+    """Map public boundary names to centered ``scipy.ndimage`` modes."""
+    return {
+        "symmetric": "reflect",
+        "constant": "constant",
+        "edge": "nearest",
+        "wrap": "wrap",
+    }[_normalize_boundary(boundary)]
+
+
+def _sampling_positions(length: int, sampling_step: int) -> Array:
+    return np.arange(0, length, sampling_step, dtype=int)
 
 
 def cartesian_hermite_transform(
@@ -281,38 +397,183 @@ def cartesian_hermite_transform(
     filter_bank: Mapping,
     sampling_step: int = 1,
     boundary: str = "symmetric",
+    orders: Optional[Sequence[Order]] = None,
 ) -> CoeffDict:
-    """Compute dense or subsampled Cartesian Hermite coefficient maps."""
-    if not isinstance(sampling_step, (int, np.integer)) or sampling_step < 1:
-        raise ValueError("sampling_step must be a positive integer.")
+    """Compute Cartesian Hermite coefficient maps by explicit correlation.
 
-    kernel_size = int(filter_bank["kernel_size"])
-    max_sampling_step = max(1, int(filter_bank["max_order"]))
-    if sampling_step > max_sampling_step:
-        raise ValueError(
-            "sampling_step must satisfy T <= max_order, matching the MATLAB "
-            f"DHT restriction. Received T={sampling_step}, max_order={filter_bank['max_order']}."
+    Parameters
+    ----------
+    image : ndarray, shape (rows, columns)
+        Input image in its original numeric scale.
+    filter_bank : mapping
+        Bank returned by :func:`build_hermite_gaussian_filter_bank`.
+    sampling_step : int, default=1
+        Distance in pixels between analysis positions.
+    boundary : {"symmetric", "constant", "edge", "wrap"}, default="symmetric"
+        Padding rule used before local correlation.
+    orders : sequence of pairs, optional
+        Channels to compute. By default the public bank orders are used.
+
+    Returns
+    -------
+    coefficients : dict
+        Two-dimensional maps indexed by ``(m, n)``.
+    """
+    if isinstance(sampling_step, (bool, np.bool_)) or not isinstance(
+        sampling_step, (int, np.integer)
+    ) or sampling_step < 1:
+        raise ValueError("sampling_step must be a positive integer.")
+    values = np.asarray(image, dtype=np.float64)
+    if values.ndim != 2 or values.size == 0:
+        raise ValueError("image must be a non-empty two-dimensional array.")
+    if not np.isfinite(values).all():
+        raise ValueError("image contains NaN or infinite values.")
+
+    selected_orders = list(filter_bank["orders"] if orders is None else orders)
+    missing = [
+        order
+        for order in selected_orders
+        if order not in filter_bank["analysis_filters"]
+    ]
+    if missing:
+        raise KeyError(f"The filter bank does not contain orders {missing[:5]}.")
+
+    mode = _ndimage_boundary(boundary)
+    horizontal_orders = sorted({m for m, _ in selected_orders})
+    horizontal_responses = {
+        m: correlate1d(
+            values,
+            np.asarray(filter_bank["analysis_filters_1d"][m], dtype=np.float64),
+            axis=1,
+            mode=mode,
+            cval=0.0,
+        )
+        for m in horizontal_orders
+    }
+    coefficients: CoeffDict = {}
+    for m, n in selected_orders:
+        dense = correlate1d(
+            horizontal_responses[m],
+            np.asarray(filter_bank["analysis_filters_1d"][n], dtype=np.float64),
+            axis=0,
+            mode=mode,
+            cval=0.0,
+        )
+        coefficients[(m, n)] = dense[::sampling_step, ::sampling_step].copy()
+    return coefficients
+
+
+def synthesize_hermite_image(
+    coefficients: Mapping[Order, Array],
+    filter_bank: Mapping,
+    image_shape: Tuple[int, int],
+    sampling_step: int = 1,
+    boundary: str = "symmetric",
+) -> Array:
+    """Synthesize an image by overlap-add and frame normalization.
+
+    Parameters
+    ----------
+    coefficients : mapping
+        Cartesian coefficient maps for the public orders of ``filter_bank``.
+    filter_bank : mapping
+        Hermite--Gaussian filter bank used in analysis.
+    image_shape : tuple of int
+        Requested output shape.
+    sampling_step : int, default=1
+        Analysis-grid spacing.
+    boundary : {"symmetric", "constant", "edge", "wrap"}, default="symmetric"
+        Must match analysis. It fixes the coefficient convention; overlap-add
+        uses the same centered support and sampling positions.
+
+    Returns
+    -------
+    reconstructed : ndarray
+        Truncated frame synthesis with exactly ``image_shape``.
+
+    Notes
+    -----
+    The numerator sums shifted analysis functions weighted by their local
+    coefficients. The denominator is the sum of shifted Gaussian windows
+    squared over exactly the same sampling lattice.
+    """
+    if isinstance(sampling_step, (bool, np.bool_)) or not isinstance(
+        sampling_step, (int, np.integer)
+    ) or sampling_step < 1:
+        raise ValueError("sampling_step must be a positive integer.")
+    _normalize_boundary(boundary)
+    if (
+        not isinstance(image_shape, tuple)
+        or len(image_shape) != 2
+        or any(
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, np.integer))
+            or value <= 0
+            for value in image_shape
+        )
+    ):
+        raise ValueError("image_shape must contain two positive integers.")
+
+    height, width = (int(image_shape[0]), int(image_shape[1]))
+    orders = list(filter_bank["orders"])
+    missing = [order for order in orders if order not in coefficients]
+    if missing:
+        raise KeyError(f"Missing coefficients required for synthesis: {missing[:5]}.")
+
+    row_positions = _sampling_positions(height, sampling_step)
+    column_positions = _sampling_positions(width, sampling_step)
+    expected_shape = (len(row_positions), len(column_positions))
+    for order in orders:
+        if np.asarray(coefficients[order]).shape != expected_shape:
+            raise ValueError(
+                f"Coefficient L_{order} has shape "
+                f"{np.asarray(coefficients[order]).shape}; expected {expected_shape}."
+            )
+
+    sampling_mask = np.zeros((height, width), dtype=np.float64)
+    sampling_mask[np.ix_(row_positions, column_positions)] = 1.0
+    numerator = np.zeros((height, width), dtype=np.float64)
+
+    for m, n in orders:
+        upsampled = np.zeros((height, width), dtype=np.float64)
+        upsampled[np.ix_(row_positions, column_positions)] = np.asarray(
+            coefficients[(m, n)], dtype=np.float64
+        )
+        horizontal = convolve1d(
+            upsampled,
+            np.asarray(filter_bank["analysis_filters_1d"][m], dtype=np.float64),
+            axis=1,
+            mode="constant",
+            cval=0.0,
+        )
+        numerator += convolve1d(
+            horizontal,
+            np.asarray(filter_bank["analysis_filters_1d"][n], dtype=np.float64),
+            axis=0,
+            mode="constant",
+            cval=0.0,
         )
 
-    orders = list(filter_bank["orders"])
-    filters = np.stack(
-        [filter_bank["analysis_filters"][order] for order in orders], axis=0
+    denominator = convolve1d(
+        sampling_mask,
+        np.asarray(filter_bank["analysis_filters_1d"][0], dtype=np.float64),
+        axis=1,
+        mode="constant",
+        cval=0.0,
     )
-
-    pads = _padding_for_kernel(kernel_size)
-    padded = _pad_image(image, pads, boundary)
-    patch_view = sliding_window_view(padded, (kernel_size, kernel_size))
-    sampled_patches = patch_view[::sampling_step, ::sampling_step]
-
-    # Correlation: no spatial reversal of the analysis filter.
-    coefficient_stack = np.einsum(
-        "ijxy,kxy->ijk", sampled_patches, filters, optimize=True
+    denominator = convolve1d(
+        denominator,
+        np.asarray(filter_bank["analysis_filters_1d"][0], dtype=np.float64),
+        axis=0,
+        mode="constant",
+        cval=0.0,
     )
-
-    return {
-        order: coefficient_stack[..., index].copy()
-        for index, order in enumerate(orders)
-    }
+    if np.any(denominator <= 0.0):
+        raise ValueError(
+            "sampling_step leaves pixels without coverage for the automatically "
+            "selected finite support."
+        )
+    return np.divide(numerator, denominator).astype(np.float64, copy=False)
 
 
 def inverse_cartesian_hermite_transform(
@@ -322,92 +583,31 @@ def inverse_cartesian_hermite_transform(
     sampling_step: int = 1,
     boundary: str = "symmetric",
 ) -> Array:
-    """Reconstruct an image by dual-filter synthesis and overlap-add."""
-    if not isinstance(sampling_step, (int, np.integer)) or sampling_step < 1:
-        raise ValueError("sampling_step must be a positive integer.")
-
-    orders = list(filter_bank["orders"])
-    missing = [order for order in orders if order not in coefficients]
-    if missing:
-        raise KeyError(f"Missing coefficients required for synthesis: {missing[:5]}")
-
-    first_shape = np.asarray(coefficients[orders[0]]).shape
-    if len(first_shape) != 2:
-        raise ValueError("Each coefficient map must be two-dimensional.")
-    for order in orders:
-        if np.asarray(coefficients[order]).shape != first_shape:
-            raise ValueError("All coefficient maps must have the same shape.")
-
-    height, width = image_shape
-    kernel_size = int(filter_bank["kernel_size"])
-    pads = _padding_for_kernel(kernel_size)
-
-    # The coefficient at (i,j) represents the patch whose top-left location
-    # in the padded image is (i*T,j*T).
-    position_height = height
-    position_width = width
-    accumulator_shape = (
-        position_height + kernel_size - 1,
-        position_width + kernel_size - 1,
+    """Compatibility name for :func:`synthesize_hermite_image`."""
+    return synthesize_hermite_image(
+        coefficients,
+        filter_bank,
+        image_shape,
+        sampling_step=sampling_step,
+        boundary=boundary,
     )
-    accumulator = np.zeros(accumulator_shape, dtype=np.float64)
-
-    sampling_mask = np.zeros((position_height, position_width), dtype=np.float64)
-    row_positions = np.arange(0, height, sampling_step)
-    col_positions = np.arange(0, width, sampling_step)
-
-    expected_shape = (len(row_positions), len(col_positions))
-    if first_shape != expected_shape:
-        raise ValueError(
-            f"Coefficient maps have shape {first_shape}, but {expected_shape} "
-            "is expected from image_shape and sampling_step."
-        )
-
-    sampling_mask[np.ix_(row_positions, col_positions)] = 1.0
-
-    for order in orders:
-        upsampled = np.zeros((position_height, position_width), dtype=np.float64)
-        upsampled[np.ix_(row_positions, col_positions)] = coefficients[order]
-        synthesis_filter = filter_bank["synthesis_filters"][order]
-        accumulator += convolve2d(upsampled, synthesis_filter, mode="full")
-
-    coverage = convolve2d(
-        sampling_mask, np.ones((kernel_size, kernel_size), dtype=np.float64), mode="full"
-    )
-    reconstructed_padded = np.divide(
-        accumulator,
-        coverage,
-        out=np.zeros_like(accumulator),
-        where=coverage > 0,
-    )
-    top, bottom, left, right = pads
-    cropped_coverage = coverage[
-        top : top + height,
-        left : left + width,
-    ]
-    if np.any(cropped_coverage <= 0):
-        raise RuntimeError(
-            "The chosen sampling_step leaves uncovered pixels inside the output image."
-        )
-    reconstructed = reconstructed_padded[
-        top : top + height,
-        left : left + width,
-    ]
-    return reconstructed.astype(np.float64, copy=False)
 
 
 # -----------------------------------------------------------------------------
-# Orientation and normalized steering (ported from MATLAB RDHT recurrence)
+# Orientation and steering
 # -----------------------------------------------------------------------------
 
 
 def dominant_gradient_theta(coefficients: Mapping[Order, Array]) -> Array:
-    """Return theta = atan2(L_01, L_10) in [-pi, pi], without modulo pi."""
+    """Return ``atan2(L_01, L_10)`` in radians without modulo reduction."""
     if (1, 0) not in coefficients or (0, 1) not in coefficients:
         raise ValueError(
-            "Dominant gradient orientation requires coefficients (1,0) and (0,1)."
+            "Dominant gradient orientation requires coefficients (1, 0) and (0, 1)."
         )
-    return np.arctan2(coefficients[(0, 1)], coefficients[(1, 0)]).astype(np.float64)
+    return np.arctan2(
+        np.asarray(coefficients[(0, 1)], dtype=np.float64),
+        np.asarray(coefficients[(1, 0)], dtype=np.float64),
+    )
 
 
 def _coefficients_to_stack(
@@ -415,131 +615,98 @@ def _coefficients_to_stack(
 ) -> Array:
     missing = [order for order in orders if order not in coefficients]
     if missing:
-        raise KeyError(f"Missing coefficient orders: {missing[:5]}")
-    return np.stack([np.asarray(coefficients[order]) for order in orders], axis=-1)
+        raise KeyError(f"Missing coefficient orders: {missing[:5]}.")
+    values = [np.asarray(coefficients[order], dtype=np.float64) for order in orders]
+    if not values:
+        raise ValueError("At least one coefficient order is required.")
+    if any(value.shape != values[0].shape for value in values):
+        raise ValueError("All coefficient maps must have the same shape.")
+    if values[0].ndim != 2:
+        raise ValueError("Coefficient maps must be two-dimensional.")
+    return np.stack(values, axis=-1)
 
 
 def _stack_to_coefficients(stack: Array, orders: Sequence[Order]) -> CoeffDict:
-    return {order: stack[..., index].copy() for index, order in enumerate(orders)}
+    return {
+        order: np.asarray(stack[..., channel], dtype=np.float64).copy()
+        for channel, order in enumerate(orders)
+    }
 
 
 def _rotation_angle_array(theta: Union[float, Array], spatial_shape: Tuple[int, int]) -> Array:
     angle = np.asarray(theta, dtype=np.float64)
+    if not np.isfinite(angle).all():
+        raise ValueError("theta must contain only finite values.")
     if angle.ndim == 0:
         return np.full(spatial_shape, float(angle), dtype=np.float64)
-    if angle.shape != spatial_shape:
+    try:
+        return np.broadcast_to(angle, spatial_shape).astype(np.float64, copy=False)
+    except ValueError as exc:
         raise ValueError(
-            f"theta has shape {angle.shape}; expected scalar or {spatial_shape}."
+            f"theta has shape {angle.shape}; expected a scalar or a map "
+            f"broadcastable to {spatial_shape}."
+        ) from exc
+
+
+def _rotate_complete_block(block: Array, theta: Array) -> Array:
+    """Rotate one complete normalized Hermite block of equal total order."""
+    degree = block.shape[-1] - 1
+    if degree <= 0:
+        return np.asarray(block, dtype=np.float64).copy()
+
+    cosine = np.cos(theta)
+    sine = np.sin(theta)
+    normalization = np.sqrt(
+        np.asarray([comb(degree, index) for index in range(degree + 1)])
+    )
+    work = np.asarray(block, dtype=np.float64).copy()
+    if degree > 1:
+        work[..., 1:degree] /= normalization[1:degree]
+
+    rotated = np.empty_like(work)
+    active_length = degree + 1
+    for output_order in range(degree):
+        reduced = work.copy()
+        reduced_length = active_length
+        for _ in range(output_order, degree):
+            reduced = (
+                cosine[..., None] * reduced[..., : reduced_length - 1]
+                + sine[..., None] * reduced[..., 1:reduced_length]
+            )
+            reduced_length -= 1
+        rotated[..., output_order] = (
+            reduced[..., 0] * normalization[output_order]
         )
-    return angle
+        work = (
+            cosine[..., None] * work[..., 1:active_length]
+            - sine[..., None] * work[..., : active_length - 1]
+        )
+        active_length -= 1
+    rotated[..., degree] = work[..., 0]
+    return rotated
 
 
-def _rdht_forward_stack(
-    coefficient_stack: Array,
+def _rotate_complete_coefficients(
+    coefficients: Mapping[Order, Array],
     theta: Union[float, Array],
-    max_order: int,
-    max_total_order: int,
-) -> Array:
-    """MATLAB-compatible normalized RDHT recurrence, without angle embedding."""
-    y = np.asarray(coefficient_stack, dtype=np.float64)
-    if y.ndim != 3:
-        raise ValueError("coefficient_stack must have shape (rows, cols, channels).")
-
-    expected_orders = []
-    for total in range(max_total_order + 1):
-        for m in range(max(0, total - max_order), min(max_order, total) + 1):
-            expected_orders.append((m, total - m))
-    if y.shape[-1] != len(expected_orders):
-        raise ValueError(
-            f"Expected {len(expected_orders)} coefficient channels; got {y.shape[-1]}."
-        )
-
-    angle = _rotation_angle_array(theta, y.shape[:2])
-    c = np.cos(angle)
-    s = np.sin(angle)
-    z = y.copy()
-
-    position = 1  # skip L_00
-
-    # Complete total-order blocks above/on the main anti-diagonal.
-    for total in range(1, min(max_total_order, max_order) + 1):
-        block_length = total + 1
-        h = y[..., position : position + block_length].copy()
-        normalization = np.sqrt(
-            np.array([comb(total, k) for k in range(block_length)], dtype=np.float64)
-        )
-
-        if total > 1:
-            h[..., 1:total] /= normalization[1:total]
-
-        h_length = block_length
-        for m_index in range(total):
-            l = h.copy()
-            l_length = h_length
-            for _ in range(m_index, total):
-                l = (
-                    c[..., None] * l[..., : l_length - 1]
-                    + s[..., None] * l[..., 1:l_length]
-                )
-                l_length -= 1
-
-            z[..., position + m_index] = l[..., 0] * normalization[m_index]
-            h = (
-                c[..., None] * h[..., 1:h_length]
-                - s[..., None] * h[..., : h_length - 1]
+    orders: Sequence[Order],
+) -> CoeffDict:
+    stack = _coefficients_to_stack(coefficients, orders)
+    angle_map = _rotation_angle_array(theta, stack.shape[:2])
+    result = stack.copy()
+    for total in sorted({m + n for m, n in orders}):
+        block_orders = [(m, total - m) for m in range(total, -1, -1)]
+        missing = [order for order in block_orders if order not in orders]
+        if missing:
+            raise ValueError(
+                f"Steering requires the complete total-order block {total}; "
+                f"missing {missing}."
             )
-            h_length -= 1
-
-        z[..., position + total] = h[..., 0]
-        position += block_length
-
-    # Partial blocks below the main anti-diagonal. This is the part needed
-    # for a full square m,n <= max_order when max_total_order > max_order.
-    extra_blocks = min(max_total_order - max_order, max_order - 1)
-    for offset in range(1, extra_blocks + 1):
-        reduced_order = max_order - offset
-        block_length = reduced_order + 1
-        h = y[..., position : position + block_length].copy()
-        normalization = np.sqrt(
-            np.array(
-                [comb(reduced_order, k) for k in range(block_length)],
-                dtype=np.float64,
-            )
+        indices = [orders.index(order) for order in block_orders]
+        result[..., indices] = _rotate_complete_block(
+            stack[..., indices], angle_map
         )
-
-        if reduced_order > 1:
-            h[..., 1:reduced_order] /= normalization[1:reduced_order]
-
-        h_length = block_length
-        for m_index in range(reduced_order):
-            l = h.copy()
-            l_length = h_length
-            for _ in range(m_index, reduced_order):
-                l = (
-                    c[..., None] * l[..., : l_length - 1]
-                    + s[..., None] * l[..., 1:l_length]
-                )
-                l_length -= 1
-
-            z[..., position + m_index] = l[..., 0] * normalization[m_index]
-            h = (
-                c[..., None] * h[..., 1:h_length]
-                - s[..., None] * h[..., : h_length - 1]
-            )
-            h_length -= 1
-
-        z[..., position + reduced_order] = h[..., 0]
-        position += block_length
-
-    # For the full square D=2N, the final corner coefficient L_{N,N}
-    # forms a one-element block and is invariant under this finite RDHT
-    # recurrence, so it remains unchanged in z.
-    if position not in {y.shape[-1], y.shape[-1] - 1}:
-        raise RuntimeError(
-            f"RDHT channel traversal ended at {position}, but {y.shape[-1]} channels exist."
-        )
-
-    return z
+    return _stack_to_coefficients(result, orders)
 
 
 def rotate_hermite_coefficients(
@@ -548,12 +715,45 @@ def rotate_hermite_coefficients(
     max_order: int,
     coefficient_region: str = "square",
 ) -> CoeffDict:
-    """Rotate normalized Hermite coefficients with the MATLAB RDHT recurrence."""
-    orders = list(hermite_orders(max_order, coefficient_region))
-    max_total_order = max(m + n for m, n in orders) if orders else 0
-    stack = _coefficients_to_stack(coefficients, orders)
-    rotated = _rdht_forward_stack(stack, theta, max_order, max_total_order)
-    return _stack_to_coefficients(rotated, orders)
+    """Rotate coefficients within complete blocks of equal total order.
+
+    Parameters
+    ----------
+    coefficients : mapping
+        Cartesian coefficient maps. In ``square`` mode this mapping must also
+        contain the auxiliary triangle through total order ``2*max_order``.
+    theta : float or ndarray
+        Steering angle in radians.
+    max_order : int
+        Region limit.
+    coefficient_region : {"triangle", "square"}, default="square"
+        Determines the complete order set required for steering.
+
+    Returns
+    -------
+    rotated : dict
+        Complete rotated mapping. A square caller can extract its public pairs
+        after steering.
+    """
+    limit = _nonnegative_integer("max_order", max_order)
+    if not isinstance(coefficient_region, str):
+        raise ValueError("coefficient_region must be 'triangle' or 'square'.")
+    region = coefficient_region.lower()
+    if region == "triangle":
+        required_orders = list(hermite_orders(limit, "triangle"))
+    elif region == "square":
+        required_orders = list(hermite_orders(2 * limit, "triangle"))
+    else:
+        raise ValueError("coefficient_region must be 'triangle' or 'square'.")
+    missing = [order for order in required_orders if order not in coefficients]
+    if missing:
+        raise ValueError(
+            "Square steering requires auxiliary complete blocks through total "
+            f"order {2 * limit}; missing {missing[:5]}."
+            if region == "square"
+            else f"Steering coefficients are missing orders {missing[:5]}."
+        )
+    return _rotate_complete_coefficients(coefficients, theta, required_orders)
 
 
 def inverse_rotate_hermite_coefficients(
@@ -562,14 +762,19 @@ def inverse_rotate_hermite_coefficients(
     max_order: int,
     coefficient_region: str = "square",
 ) -> CoeffDict:
-    """Undo RDHT steering by applying the same recurrence at angle -theta."""
-    angle = -np.asarray(theta, dtype=np.float64)
+    """Undo steering by applying the same complete-block operator at ``-theta``."""
     return rotate_hermite_coefficients(
         rotated_coefficients,
-        angle,
+        -np.asarray(theta, dtype=np.float64),
         max_order=max_order,
         coefficient_region=coefficient_region,
     )
+
+
+def _extract_coefficients(
+    coefficients: Mapping[Order, Array], orders: Sequence[Order]
+) -> CoeffDict:
+    return {order: np.asarray(coefficients[order]) for order in orders}
 
 
 # -----------------------------------------------------------------------------
@@ -580,9 +785,21 @@ def inverse_rotate_hermite_coefficients(
 def coefficient_roundtrip_metrics(
     original: Mapping[Order, Array], recovered: Mapping[Order, Array]
 ) -> dict:
+    """Measure the numerical error of steering followed by inverse steering."""
     orders = list(original.keys())
+    if not orders:
+        raise ValueError("At least one coefficient map is required.")
+    missing = [order for order in orders if order not in recovered]
+    if missing:
+        raise KeyError(f"Recovered coefficients are missing orders {missing[:5]}.")
     differences = np.concatenate(
-        [(np.asarray(original[o]) - np.asarray(recovered[o])).ravel() for o in orders]
+        [
+            (
+                np.asarray(original[order], dtype=np.float64)
+                - np.asarray(recovered[order], dtype=np.float64)
+            ).ravel()
+            for order in orders
+        ]
     )
     mse = float(np.mean(differences**2))
     return {
@@ -593,27 +810,57 @@ def coefficient_roundtrip_metrics(
     }
 
 
-def reconstruction_metrics(original: Array, reconstructed: Array) -> dict:
-    difference = np.asarray(original, dtype=np.float64) - np.asarray(
-        reconstructed, dtype=np.float64
-    )
+def reconstruction_metrics(
+    original: Array,
+    reconstructed: Array,
+    data_range: Optional[float] = None,
+) -> dict:
+    """Compute MSE, RMSE, MAE, maximum error and PSNR."""
+    source = np.asarray(original)
+    estimate = np.asarray(reconstructed)
+    if source.shape != estimate.shape or source.size == 0:
+        raise ValueError("original and reconstructed must have the same non-empty shape.")
+    source64 = source.astype(np.float64, copy=False)
+    estimate64 = estimate.astype(np.float64, copy=False)
+    difference = source64 - estimate64
+    absolute = np.abs(difference)
     mse = float(np.mean(difference**2))
     rmse = float(np.sqrt(mse))
-    mae = float(np.mean(np.abs(difference)))
-    max_abs = float(np.max(np.abs(difference)))
-    psnr = float("inf") if mse == 0.0 else float(10.0 * np.log10(1.0 / mse))
+
+    if data_range is None:
+        if np.issubdtype(source.dtype, np.integer):
+            limits = np.iinfo(source.dtype)
+            dynamic_range = float(limits.max - limits.min)
+        else:
+            dynamic_range = float(np.max(source64) - np.min(source64))
+            if dynamic_range == 0.0:
+                dynamic_range = max(float(np.max(np.abs(source64))), 1.0)
+    else:
+        dynamic_range = float(data_range)
+        if not np.isfinite(dynamic_range) or dynamic_range <= 0.0:
+            raise ValueError("data_range must be finite and positive.")
+    psnr = (
+        float("inf")
+        if mse == 0.0
+        else float(20.0 * np.log10(dynamic_range / rmse))
+    )
     return {
         "mse": mse,
         "rmse": rmse,
-        "mae": mae,
-        "max_abs_error": max_abs,
+        "mae": float(np.mean(absolute)),
+        "max_abs_error": float(np.max(absolute)),
         "psnr": psnr,
     }
 
 
-def energy_image(coefficients: Mapping[Order, Array], include_dc: bool = False) -> Array:
-    first = next(iter(coefficients.values()))
-    energy = np.zeros_like(first, dtype=np.float64)
+def energy_image(
+    coefficients: Mapping[Order, Array], include_dc: bool = False
+) -> Array:
+    """Return the root-sum-square energy of selected coefficient maps."""
+    if not coefficients:
+        raise ValueError("At least one coefficient map is required.")
+    first = np.asarray(next(iter(coefficients.values())), dtype=np.float64)
+    energy = np.zeros_like(first)
     for order, value in coefficients.items():
         if not include_dc and order == (0, 0):
             continue
@@ -622,35 +869,29 @@ def energy_image(coefficients: Mapping[Order, Array], include_dc: bool = False) 
 
 
 def save_coefficients_grid(
-    coefficients: Mapping[Order, Array],
-    output_path: PathLike,
-    title: str,
+    coefficients: Mapping[Order, Array], output_path: PathLike, title: str
 ) -> None:
+    """Save coefficient maps in their ``(m, n)`` positions."""
     path = _ensure_parent(output_path)
     orders = list(coefficients.keys())
     max_m = max(m for m, _ in orders)
     max_n = max(n for _, n in orders)
-
     figure, axes = plt.subplots(
         max_n + 1,
         max_m + 1,
         figsize=(2.7 * (max_m + 1), 2.7 * (max_n + 1)),
         squeeze=False,
     )
-
     for n in range(max_n + 1):
         for m in range(max_m + 1):
             axis = axes[n, m]
             order = (m, n)
             if order in coefficients:
                 value = np.asarray(coefficients[order])
-                limit = float(np.max(np.abs(value)))
-                if limit == 0.0:
-                    limit = 1.0
-                axis.imshow(value, cmap="gray", vmin=-limit, vmax=limit)
+                limit = max(float(np.max(np.abs(value))), np.finfo(float).eps)
+                axis.imshow(value, cmap="coolwarm", vmin=-limit, vmax=limit)
                 axis.set_title(rf"$L_{{{m},{n}}}$")
             axis.axis("off")
-
     figure.suptitle(title)
     figure.tight_layout()
     figure.savefig(path, dpi=200, bbox_inches="tight")
@@ -658,46 +899,48 @@ def save_coefficients_grid(
 
 
 def save_theta_image(theta: Array, output_path: PathLike) -> None:
+    """Save an orientation map expressed visually in degrees."""
     path = _ensure_parent(output_path)
     figure, axis = plt.subplots(figsize=(7, 6))
-    image = axis.imshow(np.rad2deg(theta), cmap="gray")
-    axis.set_title(r"Orientación local $\theta$ [grados]")
+    shown = axis.imshow(np.rad2deg(theta), cmap="twilight", vmin=-180, vmax=180)
+    axis.set_title(r"Orientacion local $\theta$ [grados]")
     axis.axis("off")
-    figure.colorbar(image, ax=axis)
+    figure.colorbar(shown, ax=axis)
     figure.tight_layout()
     figure.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(figure)
 
 
 def save_reconstruction_comparison(
-    original: Array,
-    reconstructed: Array,
-    output_path: PathLike,
+    original: Array, reconstructed: Array, output_path: PathLike
 ) -> None:
+    """Save original, reconstructed image and absolute error."""
     path = _ensure_parent(output_path)
-    error = np.abs(original - reconstructed)
+    original64 = np.asarray(original, dtype=np.float64)
+    reconstructed64 = np.asarray(reconstructed, dtype=np.float64)
+    error = np.abs(original64 - reconstructed64)
+    lower = float(min(np.min(original64), np.min(reconstructed64)))
+    upper = float(max(np.max(original64), np.max(reconstructed64)))
+    if lower == upper:
+        upper = lower + 1.0
 
     figure, axes = plt.subplots(1, 3, figsize=(14, 4.5))
-    axes[0].imshow(original, cmap="gray", vmin=0.0, vmax=1.0)
+    axes[0].imshow(original64, cmap="gray", vmin=lower, vmax=upper)
     axes[0].set_title("Original")
-    axes[0].axis("off")
-
-    # Display clipping is visual only; metrics use the raw reconstruction.
-    axes[1].imshow(np.clip(reconstructed, 0.0, 1.0), cmap="gray", vmin=0.0, vmax=1.0)
+    axes[1].imshow(reconstructed64, cmap="gray", vmin=lower, vmax=upper)
     axes[1].set_title("Reconstruida")
-    axes[1].axis("off")
-
-    error_plot = axes[2].imshow(error, cmap="gray")
+    shown_error = axes[2].imshow(error, cmap="magma", vmin=0.0)
     axes[2].set_title(r"Error absoluto $|I-\hat I|$")
-    axes[2].axis("off")
-    figure.colorbar(error_plot, ax=axes[2], fraction=0.046, pad=0.04)
-
+    for axis in axes:
+        axis.axis("off")
+    figure.colorbar(shown_error, ax=axes[2], fraction=0.046, pad=0.04)
     figure.tight_layout()
     figure.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(figure)
 
 
 def save_metrics_csv(metrics: Mapping[str, float], output_path: PathLike) -> None:
+    """Save scalar metrics as a two-column CSV file."""
     path = _ensure_parent(output_path)
     with path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
@@ -707,7 +950,7 @@ def save_metrics_csv(metrics: Mapping[str, float], output_path: PathLike) -> Non
 
 
 # -----------------------------------------------------------------------------
-# Main orchestration function
+# Main workflow
 # -----------------------------------------------------------------------------
 
 
@@ -715,87 +958,93 @@ def hermite_transform_image(
     image: Union[PathLike, Image.Image, Array],
     max_order: int = 3,
     sigma: float = 2.0,
-    kernel_size: Optional[int] = None,
     coefficient_region: str = "square",
-    exact_reconstruction: bool = True,
     sampling_step: int = 1,
     boundary: str = "symmetric",
     use_rotation: bool = True,
-    use_inverse_rotation: bool = False,
-    use_inverse_transform: bool = False,
+    use_inverse_rotation: bool = True,
+    use_inverse_transform: bool = True,
     rotation_mode: str = "dominant",
     angle: Union[float, Array] = 0.0,
     angle_unit: str = "degrees",
     output_paths: Optional[Mapping[str, PathLike]] = None,
-    rcond: float = 1e-12,
 ) -> dict:
-    """Run any requested subset of the Cartesian/rotated/inverse HT workflow.
-
-    Stage selection
-    ---------------
-    ``use_rotation=False, use_inverse_transform=False``
-        Cartesian transform only.
-
-    ``use_rotation=True, use_inverse_transform=False``
-        Cartesian transform followed by rotation.
-
-    ``use_rotation=True, use_inverse_rotation=True,
-    use_inverse_transform=False``
-        Cartesian transform -> rotation -> inverse rotation. No image synthesis.
-
-    ``use_rotation=False, use_inverse_transform=True``
-        Cartesian transform followed by direct Cartesian synthesis.
-
-    ``use_rotation=True, use_inverse_transform=True``
-        Full flow: Cartesian transform -> rotation -> inverse rotation -> image
-        synthesis. Inverse rotation is performed automatically because it is
-        required before Cartesian synthesis.
+    """Run the finite-support Hermite--Gaussian transform workflow.
 
     Parameters
     ----------
-    max_order:
-        In ``square`` mode, maximum order independently on x and y. The full
-        coefficient set contains (max_order+1)^2 maps.
-        In ``triangle`` mode, maximum total order m+n.
-    exact_reconstruction:
-        Requires ``square`` mode and ``kernel_size=max_order+1``. This creates
-        a complete local discrete basis and dual synthesis filters.
-    use_inverse_rotation:
-        Enables the rotation round trip even when image synthesis is disabled.
-    output_paths:
-        Optional paths with any of these keys:
-        ``cartesian_coefficients``, ``rotated_coefficients``,
-        ``recovered_cartesian_coefficients``, ``theta``, ``reconstruction``,
-        ``metrics_csv``. Parent directories are created automatically.
+    image : path-like, PIL.Image.Image or ndarray
+        Grayscale or RGB input. Its numeric scale is preserved.
+    max_order : int, default=3
+        Maximum total degree for ``triangle`` or maximum per-axis degree for
+        ``square``.
+    sigma : float, default=2.0
+        Gaussian scale in pixels. Filter support is selected automatically.
+    coefficient_region : {"triangle", "square"}, default="square"
+        Visible coefficient set.
+    sampling_step : int, default=1
+        Pixel spacing of the local analysis grid.
+    boundary : {"symmetric", "constant", "edge", "wrap"}, default="symmetric"
+        Boundary extension used by analysis.
+    use_rotation : bool, default=True
+        Estimate/use ``theta`` and steer the Cartesian coefficients.
+    use_inverse_rotation : bool, default=True
+        Recover Cartesian coefficients after steering.
+    use_inverse_transform : bool, default=True
+        Synthesize an image from Cartesian coefficients. When rotation is
+        active, inverse steering is performed before synthesis.
+    rotation_mode : {"dominant", "fixed"}, default="dominant"
+        ``dominant`` uses ``atan2(L_01, L_10)``; ``fixed`` uses ``angle``.
+    angle : float or ndarray, default=0.0
+        Fixed scalar angle or map broadcastable to coefficient-map shape.
+    angle_unit : {"degrees", "radians"}, default="degrees"
+        Unit of ``angle`` in fixed mode.
+    output_paths : mapping, optional
+        Paths keyed by ``cartesian_coefficients``, ``rotated_coefficients``,
+        ``recovered_cartesian_coefficients``, ``theta``, ``reconstruction`` or
+        ``metrics_csv``.
+
+    Returns
+    -------
+    result : dict
+        Public coefficient maps, angle, optional reconstruction and metrics,
+        channel stack, energy summary, filter diagnostics and output paths.
+
+    Notes
+    -----
+    Synthesis uses only the requested finite coefficient region and is
+    therefore a truncated approximation. In square mode, complete auxiliary
+    blocks through total degree ``2*max_order`` are used internally for
+    steering and inverse steering, then only public square pairs are returned.
     """
     if use_inverse_rotation and not use_rotation:
-        raise ValueError(
-            "use_inverse_rotation=True requires use_rotation=True. "
-            "For Cartesian image reconstruction without rotation, use "
-            "use_inverse_transform=True instead."
-        )
+        raise ValueError("use_inverse_rotation=True requires use_rotation=True.")
+    if not all(
+        isinstance(flag, (bool, np.bool_))
+        for flag in (use_rotation, use_inverse_rotation, use_inverse_transform)
+    ):
+        raise ValueError("Workflow flags must be boolean values.")
 
     image_array = read_image(image, dtype=np.float64)
     paths = dict(output_paths or {})
-
-    filter_bank = build_hermite_filter_bank(
+    filter_bank = build_hermite_gaussian_filter_bank(
         max_order=max_order,
         sigma=sigma,
-        kernel_size=kernel_size,
         coefficient_region=coefficient_region,
-        exact_reconstruction=exact_reconstruction,
-        rcond=rcond,
         dtype=np.float64,
     )
+    public_orders = list(filter_bank["orders"])
+    steering_orders = list(filter_bank["steering_orders"])
+    analysis_orders = steering_orders if use_rotation else public_orders
 
-    # 1) Image -> Cartesian coefficients.
-    cartesian_coefficients = cartesian_hermite_transform(
+    full_cartesian = cartesian_hermite_transform(
         image_array,
         filter_bank,
         sampling_step=sampling_step,
         boundary=boundary,
+        orders=analysis_orders,
     )
-
+    cartesian_coefficients = _extract_coefficients(full_cartesian, public_orders)
     if "cartesian_coefficients" in paths:
         save_coefficients_grid(
             cartesian_coefficients,
@@ -804,32 +1053,38 @@ def hermite_transform_image(
         )
 
     theta = None
+    full_rotated = None
     rotated_coefficients = None
+    full_recovered = None
     recovered_cartesian_coefficients = None
     coefficient_metrics = None
 
-    # 2) Cartesian -> rotated coefficients.
     if use_rotation:
+        if not isinstance(rotation_mode, str):
+            raise ValueError("rotation_mode must be 'dominant' or 'fixed'.")
         mode = rotation_mode.lower()
         if mode in {"dominant", "gradient", "grad"}:
-            theta = dominant_gradient_theta(cartesian_coefficients)
+            theta = dominant_gradient_theta(full_cartesian)
         elif mode in {"fixed", "angle"}:
-            if angle_unit.lower() in {"degree", "degrees", "deg"}:
-                theta = np.deg2rad(angle)
-            elif angle_unit.lower() in {"radian", "radians", "rad"}:
+            if not isinstance(angle_unit, str):
+                raise ValueError("angle_unit must be 'degrees' or 'radians'.")
+            unit = angle_unit.lower()
+            if unit in {"degree", "degrees", "deg"}:
+                theta = np.deg2rad(np.asarray(angle, dtype=np.float64))
+            elif unit in {"radian", "radians", "rad"}:
                 theta = np.asarray(angle, dtype=np.float64)
             else:
                 raise ValueError("angle_unit must be 'degrees' or 'radians'.")
         else:
             raise ValueError("rotation_mode must be 'dominant' or 'fixed'.")
 
-        rotated_coefficients = rotate_hermite_coefficients(
-            cartesian_coefficients,
+        full_rotated = rotate_hermite_coefficients(
+            full_cartesian,
             theta,
             max_order=max_order,
             coefficient_region=coefficient_region,
         )
-
+        rotated_coefficients = _extract_coefficients(full_rotated, public_orders)
         if "rotated_coefficients" in paths:
             save_coefficients_grid(
                 rotated_coefficients,
@@ -837,26 +1092,29 @@ def hermite_transform_image(
                 "Coeficientes Hermite rotados",
             )
         if "theta" in paths:
-            theta_for_plot = _rotation_angle_array(
-                theta, next(iter(cartesian_coefficients.values())).shape
+            save_theta_image(
+                _rotation_angle_array(
+                    theta, next(iter(cartesian_coefficients.values())).shape
+                ),
+                paths["theta"],
             )
-            save_theta_image(theta_for_plot, paths["theta"])
 
-    # 3) Rotated -> recovered Cartesian coefficients.
     need_inverse_rotation = use_rotation and (
         use_inverse_rotation or use_inverse_transform
     )
     if need_inverse_rotation:
-        recovered_cartesian_coefficients = inverse_rotate_hermite_coefficients(
-            rotated_coefficients,
+        full_recovered = inverse_rotate_hermite_coefficients(
+            full_rotated,
             theta,
             max_order=max_order,
             coefficient_region=coefficient_region,
         )
+        recovered_cartesian_coefficients = _extract_coefficients(
+            full_recovered, public_orders
+        )
         coefficient_metrics = coefficient_roundtrip_metrics(
             cartesian_coefficients, recovered_cartesian_coefficients
         )
-
         if "recovered_cartesian_coefficients" in paths:
             save_coefficients_grid(
                 recovered_cartesian_coefficients,
@@ -864,7 +1122,6 @@ def hermite_transform_image(
                 "Coeficientes cartesianos recuperados",
             )
 
-    # 4) Cartesian coefficients -> reconstructed image.
     reconstructed_image = None
     image_metrics = None
     if use_inverse_transform:
@@ -873,7 +1130,7 @@ def hermite_transform_image(
             if use_rotation
             else cartesian_coefficients
         )
-        reconstructed_image = inverse_cartesian_hermite_transform(
+        reconstructed_image = synthesize_hermite_image(
             synthesis_coefficients,
             filter_bank,
             image_shape=image_array.shape,
@@ -881,13 +1138,12 @@ def hermite_transform_image(
             boundary=boundary,
         )
         image_metrics = reconstruction_metrics(image_array, reconstructed_image)
-
         if "reconstruction" in paths:
             save_reconstruction_comparison(
                 image_array, reconstructed_image, paths["reconstruction"]
             )
 
-    all_metrics = {}
+    all_metrics: dict[str, float] = {}
     if coefficient_metrics is not None:
         all_metrics.update(coefficient_metrics)
     if image_metrics is not None:
@@ -895,14 +1151,11 @@ def hermite_transform_image(
     if "metrics_csv" in paths and all_metrics:
         save_metrics_csv(all_metrics, paths["metrics_csv"])
 
-    # Keep a direct stack for neural-network use, using the MATLAB-compatible
-    # order returned by filter_bank['orders'].
     active_coefficients = (
         rotated_coefficients if use_rotation else cartesian_coefficients
     )
-    active_stack = _coefficients_to_stack(
-        active_coefficients, filter_bank["orders"]
-    )
+    active_stack = _coefficients_to_stack(active_coefficients, public_orders)
+    coefficient_energy = energy_image(active_coefficients)
 
     return {
         "original_image": image_array,
@@ -915,23 +1168,22 @@ def hermite_transform_image(
         "reconstruction_metrics": image_metrics,
         "active_coefficients": active_coefficients,
         "coeff_stack": active_stack,
-        "transformed_image": energy_image(active_coefficients),
-        "orders": list(filter_bank["orders"]),
+        "coefficient_energy": coefficient_energy,
+        "transformed_image": coefficient_energy,
+        "orders": public_orders,
+        "auxiliary_orders": steering_orders,
         "filter_bank": filter_bank,
+        "support_radius": filter_bank["support_radius"],
         "output_paths": paths,
     }
 
 
 if __name__ == "__main__":
-    # Example: complete square transform, dominant-orientation rotation,
-    # inverse rotation and numerically exact image reconstruction.
     result = hermite_transform_image(
-        image="house.tif",
+        image=Path("Fusion_Images_ds") / "house.tif",
         max_order=3,
         sigma=2.0,
-        kernel_size=4,  # exact mode: max_order + 1
         coefficient_region="square",
-        exact_reconstruction=True,
         sampling_step=1,
         use_rotation=True,
         use_inverse_rotation=True,
@@ -946,7 +1198,7 @@ if __name__ == "__main__":
             "metrics_csv": "results/metrics.csv",
         },
     )
-
     print("Orders:", result["orders"])
+    print("Support radius:", result["support_radius"])
     print("Coefficient round-trip:", result["coefficient_roundtrip_metrics"])
     print("Reconstruction:", result["reconstruction_metrics"])
