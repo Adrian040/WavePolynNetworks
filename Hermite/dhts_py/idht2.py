@@ -1,161 +1,115 @@
-"""Direct translation of ``idht2.m``."""
+"""Reconstrucción bidimensional mediante la DHT inversa.
 
-from math import ceil, comb
-from typing import Sequence
+Este módulo sintetiza una imagen desde exactamente los coefficient maps
+seleccionados por :func:`dhtord`, incluidos todos los términos de una región
+cuadrada. La función pública es :func:`idht2`.
+"""
 
 import numpy as np
 from scipy.signal import convolve2d
 
-from ._core import expand_coefficients_2d, integer, parse_dht2_options, synthesis_filters
 from .dhtmtx import dhtmtx
 from .dhtord import dhtord
 
 
+def _sampling_step(T: int) -> int:
+    if isinstance(T, (bool, np.bool_)) or not isinstance(T, (int, np.integer)) or int(T) < 1:
+        raise ValueError("T debe ser un entero >= 1.")
+    return int(T)
+
+
+def _image_shape(image_shape) -> tuple[int, int]:
+    if isinstance(image_shape, (str, bytes)):
+        raise ValueError("image_shape debe contener exactamente dos enteros positivos.")
+    try:
+        dimensions = tuple(image_shape)
+    except TypeError as exc:
+        raise ValueError("image_shape debe contener exactamente dos enteros positivos.") from exc
+    if len(dimensions) != 2:
+        raise ValueError("image_shape debe contener exactamente dos enteros positivos.")
+    result = []
+    for value in dimensions:
+        if (
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, np.integer))
+            or int(value) < 1
+        ):
+            raise ValueError("image_shape debe contener exactamente dos enteros positivos.")
+        result.append(int(value))
+    return result[0], result[1]
+
+
 def idht2(
-    Y: np.ndarray,
-    xsiz: Sequence[int],
+    coefficients: np.ndarray,
+    image_shape: tuple[int, int],
     N: int,
     D: int,
-    T: int,
-    cod: str = " ",
-    *args,
-    shape: str | None = None,
-    return_aux: bool = False,
-):
-    """Synthesize an image from 2-D DHT coefficients."""
+    T: int = 1,
+    coefficient_region: str = "triangle",
+) -> np.ndarray:
+    """Reconstruye una imagen desde coefficient maps cartesianos.
 
-    parsed_shape, code, args = parse_dht2_options(cod, args)
-    shape = (shape or parsed_shape).lower()
-    target = tuple(int(v) for v in xsiz[:2])
-    arr = np.asarray(Y, dtype=np.float64)
+    Parameters
+    ----------
+    coefficients : ndarray, shape (sampled_rows, sampled_columns, C)
+        Stack producido por :func:`dht2` con los mismos ``N``, ``D``, ``T`` y
+        ``coefficient_region``.
+    image_shape : sequence of two int
+        Shape ``(rows, columns)`` de la imagen antes del análisis.
+    N : int
+        Escala del filter bank; sus filtros tienen longitud ``N + 1``.
+    D : int
+        Para ``"triangle"`` es el máximo orden total. Para ``"square"`` es el
+        máximo orden por eje, limitado por ``N``.
+    T : int, default=1
+        Paso de sampling usado en el análisis. Debe ser un entero >= 1.
+    coefficient_region : {"triangle", "square"}, default="triangle"
+        Región que determina exactamente qué mapas participan en la suma de
+        síntesis.
 
-    if len(xsiz) == 3:
-        bands = [
-            idht2(arr[..., k], target, N, D, T, shape, code, *args, return_aux=return_aux)
-            for k in range(int(xsiz[2]))
-        ]
-        if return_aux:
-            return np.stack([value[0] for value in bands], axis=-1), [value[1] for value in bands]
-        return np.stack(bands, axis=-1)
-    if arr.ndim == 2:
-        arr = arr[..., None]
+    Returns
+    -------
+    reconstruction : ndarray, shape image_shape
+        Imagen reconstruida en ``float64``.
 
-    quincunx = "q" in code.lower()
-    low_resolution = code[0].lower() == "l"
-    if code[0].lower() in {"l", "h"}:
-        code = code[1:] or " "
-    D = min(integer("D", D), 2 * integer("N", N))
-    T = integer("T", T, 1)
+    Notes
+    -----
+    Una región triangular truncada produce una aproximación y no se fuerza a
+    ser exacta. Con ``T=1`` y el square completo ``D=N`` se emplean los
+    ``(N+1)^2`` coefficient maps del banco.
+    """
 
-    if quincunx:
-        T2 = 2 * T
-        H, G = dhtmtx(N, min(D, N), T2)
-        H = H[::-1, :]
-        start = ceil((N + 1) / 2) - T * ceil(N / T2) + ceil(N / 2)
-        stop = ceil((N + 1) / 2) + T2 - T * ceil(N / T2) + ceil(N / 2) - 1
-        indices = np.mod(np.arange(start, stop + 1) - 1, N).astype(int)
-        W = H[indices, 0] / G[indices, 0]
-        W = np.outer(W, W)
-        W = W + np.fft.fftshift(W)
-        repetitions = (ceil(target[0] / T2), ceil(target[1] / T2))
-        quincunx_weight = np.tile(W, repetitions)[: target[0], : target[1]]
-        G = H
-    else:
-        G = synthesis_filters(N, min(D, N), T, low_resolution)
-
-    aux = None
-    key = code[0] if code else " "
-    if key == "q":
-        from .qdht import qdht
-
-        arr = qdht(arr, "inv", code[1:], N, D, *args)
-    elif key == "r":
-        from .rdht import rdht
-
-        arr, aux = rdht(arr, N, D, "inv", *(args or ("grad",)), return_theta=True)
-    elif key == "d":
-        from .ddht import ddht
-
-        arr, aux = ddht(arr, N, D, "inv", *(args or ("grad",)), return_theta=True)
-    elif key in {"s", "c"}:
-        from .sdht2 import sdht2
-
-        tau = args[0] if args else None
-        theta = args[1] if len(args) > 1 else (None if key == "c" else ...)
-        if theta is ...:
-            arr, aux, _ = sdht2(arr, N, D, tau)
-        else:
-            arr, aux, _ = sdht2(arr, N, D, tau, theta)
-    elif key == "g":
-        offset = ceil(N / T)
-        inner = arr[offset:-offset, offset:-offset, 0] if offset else arr[..., 0]
-        mean, std = float(np.mean(inner)), float(np.std(inner))
-        arr[..., 0] = 0.5 if std == 0 else (1 + np.tanh((arr[..., 0] - mean) / std)) / 2
-    elif key == "e":
-        from .edht import edht
-
-        arr = edht(arr, *(args or ()))
-    elif key == "m":
-        if len(args) < 2:
-            raise ValueError("cod='m' requires operation and scale M")
-        amount = int(args[1])
-        D, N = min(D - amount, N - amount), N - amount
-        if min(D, N) < 0:
-            raise ValueError("morphological scale exceeds N or D")
-        G = T * dhtmtx(N, min(D, N))[::-1, :]
-    elif key in {"E", "D"}:
-        from .gauge import gauge
-
-        sign = 1 if key == "E" else -1
-        count = min(D, N)
-        components = []
-        for n in range(1, count + 1):
-            a, b = gauge(arr, N, D, n, components=True)
-            components.append(np.hypot(a, b))
-        polynomial = sign * np.poly(np.ones(count))
-        for n in range(1, count + 1):
-            arr[..., 0] += polynomial[n] * components[n - 1]
-    elif key == "p":
-        if not args:
-            raise ValueError("cod='p' requires the order pair [j,k]")
-        horizontal, vertical = map(int, np.asarray(args[0]).ravel()[:2])
-        orders = dhtord(N, D, 2)
-        selected = np.flatnonzero(
-            (orders[:, 0] >= horizontal) & (orders[:, 1] >= vertical)
+    target = _image_shape(image_shape)
+    T = _sampling_step(T)
+    orders = dhtord(N, D, coefficient_region)
+    values = np.asarray(coefficients, dtype=np.float64)
+    if values.ndim != 3:
+        raise ValueError("coefficients debe ser un stack 3-D (rows, columns, channels).")
+    if values.shape[-1] != len(orders):
+        raise ValueError(
+            f"Se esperaban {len(orders)} canales según dhtord; se recibieron "
+            f"{values.shape[-1]}."
         )
-        if selected.size == 0:
-            raise ValueError("higher-order coefficients are required for prediction")
-        arr = arr[..., selected].copy()
-        D = D - horizontal - vertical
-        position = 0
-        for total in range(min(D, 2 * N) + 1):
-            for vertical_order in range(max(0, total - N), min(N, total) + 1):
-                horizontal_order = total - vertical_order
-                Cj = comb(horizontal_order + horizontal, horizontal)
-                Ck = comb(vertical_order + vertical, vertical)
-                arr[..., position] *= np.sqrt(
-                    Cj * Ck * 0.75**total * 0.25 ** (horizontal + vertical)
-                )
-                position += 1
 
-    expected = len(dhtord(N, D, 2))
-    if arr.shape[2] < expected:
-        raise ValueError(f"expected {expected} coefficient channels, got {arr.shape[2]}")
+    max_individual_order = max(max(order) for order in orders)
+    _, synthesis_filters = dhtmtx(N, max_individual_order, T)
+    expanded_shape = (target[0] + N, target[1] + N)
+    sampled_rows = np.arange(0, expanded_shape[0], T)
+    sampled_columns = np.arange(0, expanded_shape[1], T)
+    expected_spatial_shape = (sampled_rows.size, sampled_columns.size)
+    if values.shape[:2] != expected_spatial_shape:
+        raise ValueError(
+            "El shape espacial de coefficients no coincide con image_shape, N y T: "
+            f"se esperaba {expected_spatial_shape} y se recibió {values.shape[:2]}."
+        )
 
-    arr, ysiz, t0, conv_mode = expand_coefficients_2d(arr, target, N, T, shape)
-    rows = np.arange(t0, ysiz[0], T)
-    cols = np.arange(t0, ysiz[1], T)
-    if arr.shape[:2] != (len(rows), len(cols)):
-        raise ValueError("coefficient dimensions do not match N, T, shape, and xsiz")
-
-    X = np.zeros(target, dtype=np.float64)
-    for channel, (horizontal, vertical) in enumerate(dhtord(N, D, 2)):
-        yi = np.zeros(ysiz, dtype=np.float64)
-        yi[np.ix_(rows, cols)] = arr[..., channel]
-        X += convolve2d(yi, np.outer(G[:, vertical], G[:, horizontal]), mode=conv_mode)
-    if quincunx:
-        X = np.divide(X, quincunx_weight, out=np.zeros_like(X), where=quincunx_weight != 0)
-    return (X, aux) if return_aux else X
+    reconstruction = np.zeros(target, dtype=np.float64)
+    for channel, (m, n) in enumerate(orders):
+        expanded = np.zeros(expanded_shape, dtype=np.float64)
+        expanded[np.ix_(sampled_rows, sampled_columns)] = values[..., channel]
+        kernel = np.outer(synthesis_filters[:, n], synthesis_filters[:, m])
+        reconstruction += convolve2d(expanded, kernel, mode="valid")
+    return reconstruction
 
 
 __all__ = ["idht2"]

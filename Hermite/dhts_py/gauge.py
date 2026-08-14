@@ -1,4 +1,8 @@
-"""Direct translation of ``gauge.m``."""
+"""Estimación de orientación local a partir de coeficientes de Hermite.
+
+Este módulo obtiene el mapa angular ``theta`` mediante una condición basada
+en gradient o Hessian. La función pública es :func:`gauge`.
+"""
 
 from math import comb
 
@@ -8,76 +12,101 @@ from .dhtord import dhtord
 
 
 def _binomial_norm(degree: int) -> np.ndarray:
-    return np.sqrt(np.asarray([comb(degree, k) for k in range(degree + 1)], dtype=float))
+    return np.sqrt(
+        np.asarray([comb(degree, index) for index in range(degree + 1)], dtype=np.float64)
+    )
 
 
 def gauge(
-    Y: np.ndarray,
+    coefficients: np.ndarray,
     N: int,
     D: int,
-    L: int | str = 1,
-    *,
-    components: bool = False,
-    magnitude: bool = False,
-):
-    """Compute the general gauge condition from Cartesian DHT channels."""
+    mode: str = "gradient",
+    coefficient_region: str = "triangle",
+) -> np.ndarray:
+    """Calcula la orientación local de un stack DHT cartesiano.
 
-    if isinstance(L, str):
-        key = L.lower()
-        L = 1 if key == "grad" else 2 if key == "hess" else int(key)
-    L = int(L)
-    if not 1 <= L <= D:
-        raise ValueError("L must satisfy 1 <= L <= D")
+    Parameters
+    ----------
+    coefficients : ndarray, shape (rows, columns, C)
+        Coefficient maps cartesianos en el orden dado por :func:`dhtord`.
+    N : int
+        Escala del filter bank usado para calcular los coeficientes.
+    D : int
+        Límite de órdenes, interpretado según ``coefficient_region``.
+    mode : {"gradient", "hessian"}, default="gradient"
+        ``"gradient"`` usa el bloque de primer orden. ``"hessian"`` usa el
+        bloque de segundo orden y el gradient para resolver la ambigüedad de
+        dirección. También se aceptan los alias ``"grad"`` y ``"hess"``.
+    coefficient_region : {"triangle", "square"}, default="triangle"
+        Región con la que se creó el stack.
 
-    y = np.asarray(Y, dtype=np.float64)
-    if y.ndim == 4:
-        values = [
-            gauge(y[..., k], N, D, L, components=components, magnitude=magnitude)
-            for k in range(y.shape[3])
-        ]
-        if isinstance(values[0], tuple):
-            return tuple(np.stack([value[i] for value in values], axis=-1) for i in range(len(values[0])))
-        return np.stack(values, axis=-1)
-    if y.ndim != 3:
-        raise ValueError("gauge expects a coefficient stack")
+    Returns
+    -------
+    theta : ndarray, shape (rows, columns)
+        Orientación en radianes y ``float64``.
+    """
 
-    orders = dhtord(N, D, 2)
-    selected = np.flatnonzero(orders.sum(axis=1) == L)
-    if selected.size == 0:
-        raise ValueError(f"coefficient order {L} is not available")
-    degree = selected.size - 1
-    block = y[..., selected]
-    C = _binomial_norm(degree)
-    Co = C[1::2] * (-1.0) ** np.arange(C[1::2].size)
-    Ce = C[0::2] * (-1.0) ** np.arange(C[0::2].size)
-    a = np.tensordot(block[..., 1::2], Co, axes=([-1], [0]))
-    b = np.tensordot(block[..., 0::2], Ce, axes=([-1], [0]))
+    aliases = {
+        "gradient": 1,
+        "grad": 1,
+        "hessian": 2,
+        "hess": 2,
+    }
+    if not isinstance(mode, str) or mode.lower() not in aliases:
+        raise ValueError('mode debe ser "gradient" o "hessian".')
+    degree = aliases[mode.lower()]
 
-    if components:
-        return a, b
-
-    theta = np.arctan2(a, b) / max(degree, 1)
-    if degree > 1:
-        increments = np.arange(degree + 1) * np.pi / degree
-        powers = np.arange(degree + 1)
-        responses = np.stack(
-            [
-                np.sum(
-                    block
-                    * C.reshape((1,) * (block.ndim - 1) + (-1,))
-                    * np.cos(theta[..., None] + increment) ** (degree - powers)
-                    * np.sin(theta[..., None] + increment) ** powers,
-                    axis=-1,
-                )
-                for increment in increments
-            ],
-            axis=-1,
+    orders = dhtord(N, D, coefficient_region)
+    values = np.asarray(coefficients, dtype=np.float64)
+    if values.ndim != 3:
+        raise ValueError("coefficients debe ser un stack 3-D (rows, columns, channels).")
+    if values.shape[-1] != len(orders):
+        raise ValueError(
+            f"Se esperaban {len(orders)} canales según dhtord; se recibieron "
+            f"{values.shape[-1]}."
         )
-        theta = theta + np.argmax(np.abs(responses), axis=-1) * (np.pi / degree)
-        if y.shape[-1] >= 3:
-            sign = np.cos(theta) * y[..., 1] + np.sin(theta) * y[..., 2]
-            theta = np.where(sign < 0, theta - np.pi, theta)
-    return (theta, np.hypot(a, b)) if magnitude else theta
+
+    selected = [index for index, order in enumerate(orders) if sum(order) == degree]
+    if len(selected) != degree + 1:
+        raise ValueError(f"No está disponible el bloque completo de orden total {degree}.")
+
+    block = values[..., selected]
+    normalization = _binomial_norm(degree)
+    odd_weights = normalization[1::2] * (-1.0) ** np.arange(normalization[1::2].size)
+    even_weights = normalization[0::2] * (-1.0) ** np.arange(normalization[0::2].size)
+    odd_component = np.tensordot(block[..., 1::2], odd_weights, axes=([-1], [0]))
+    even_component = np.tensordot(block[..., 0::2], even_weights, axes=([-1], [0]))
+
+    theta = np.arctan2(odd_component, even_component) / degree
+    if degree == 1:
+        return theta
+
+    # El Hessian define un eje, no una dirección. Se comparan sus respuestas
+    # equivalentes y el gradient fija el sentido cuando tiene magnitud no nula.
+    powers = np.arange(degree + 1)
+    increments = np.arange(degree + 1) * np.pi / degree
+    responses = np.stack(
+        [
+            np.sum(
+                block
+                * normalization
+                * np.cos(theta[..., None] + increment) ** (degree - powers)
+                * np.sin(theta[..., None] + increment) ** powers,
+                axis=-1,
+            )
+            for increment in increments
+        ],
+        axis=-1,
+    )
+    theta = theta + np.argmax(np.abs(responses), axis=-1) * (np.pi / degree)
+
+    index = {order: channel for channel, order in enumerate(orders)}
+    gradient_projection = (
+        np.cos(theta) * values[..., index[(1, 0)]]
+        + np.sin(theta) * values[..., index[(0, 1)]]
+    )
+    return np.where(gradient_projection < 0.0, theta - np.pi, theta)
 
 
 __all__ = ["gauge"]
