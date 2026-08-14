@@ -1,7 +1,8 @@
 """Transformada de Hermite rotada y su operación inversa.
 
-El steering se aplica por bloques de igual orden total y conserva el orden de
-canales definido por :func:`dhtord`. La función pública es :func:`rdht`.
+El steering se aplica por bloques completos de igual orden total y conserva el
+orden de canales definido por :func:`dhtord`. La función pública es
+:func:`rdht`.
 """
 
 from math import comb
@@ -85,7 +86,8 @@ def rdht(
         alias.
     coefficient_region : {"triangle", "square"}, default="triangle"
         Región usada para crear el stack. Cada bloque disponible se obtiene de
-        :func:`dhtord`; no se presupone una cantidad triangular de canales.
+        :func:`dhtord`. El modo square sólo admite la base completa ``D=N``;
+        un square parcial no contiene bloques cerrados bajo steering.
 
     Returns
     -------
@@ -103,6 +105,13 @@ def rdht(
         raise ValueError('direction debe ser "forward" o "inverse".')
 
     orders = dhtord(N, D, coefficient_region)
+    if coefficient_region == "square" and int(D) != int(N):
+        raise ValueError(
+            "RDHT sobre un square parcial no contiene todos los componentes "
+            "necesarios de algunos órdenes totales. Use coefficient_region="
+            '"triangle" para steering truncado por orden total o use el square '
+            "completo D=N."
+        )
     values = np.asarray(coefficients, dtype=np.float64)
     if values.ndim != 3:
         raise ValueError("coefficients debe ser un stack 3-D (rows, columns, channels).")

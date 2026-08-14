@@ -18,12 +18,31 @@ def _sampling_step(T: int) -> int:
     return int(T)
 
 
+def _symmetric_indices(length: int, width: int) -> np.ndarray:
+    """Índices de una extensión que refleja incluyendo la muestra de borde."""
+
+    positions = np.arange(-width, length + width, dtype=int)
+    period = 2 * length
+    folded = np.mod(positions, period)
+    return np.where(folded < length, folded, period - 1 - folded)
+
+
+def _symmetric_extension(image: np.ndarray, N: int) -> np.ndarray:
+    width = (N + 1) // 2
+    if width == 0:
+        return image
+    rows = _symmetric_indices(image.shape[0], width)
+    columns = _symmetric_indices(image.shape[1], width)
+    return image[np.ix_(rows, columns)]
+
+
 def dht2(
     image: np.ndarray,
     N: int,
     D: int,
     T: int = 1,
     coefficient_region: str = "triangle",
+    shape: str = "full",
 ) -> np.ndarray:
     """Calcula la DHT cartesiana de una imagen grayscale.
 
@@ -43,17 +62,22 @@ def dht2(
         valores mayores realizan subsampling.
     coefficient_region : {"triangle", "square"}, default="triangle"
         Selección triangular por orden total o cuadrada por orden en cada eje.
+    shape : {"full", "symm"}, default="full"
+        ``"full"`` conserva toda la convolución. ``"symm"`` extiende ambos
+        ejes por reflexión incluyendo la muestra de borde y conserva después
+        la región válida.
 
     Returns
     -------
-    coefficients : ndarray, shape (ceil((rows+N)/T), ceil((columns+N)/T), C)
-        Stack ``float64`` de coefficient maps. ``C`` y la correspondencia de
-        canales están definidos exclusivamente por :func:`dhtord`.
+    coefficients : ndarray
+        Stack ``float64`` con los canales en el último eje. Para ``"full"``,
+        su shape espacial es ``(ceil((rows+N)/T), ceil((columns+N)/T))``. En
+        ``"symm"`` se obtiene de la región válida de la imagen extendida.
 
     Notes
     -----
-    Se usa convolución ``full``. Los filtros 2-D se forman por separabilidad:
-    el primer índice ``m`` corresponde al eje horizontal y ``n`` al vertical.
+    Los filtros 2-D se forman por separabilidad. El primer índice ``m``
+    corresponde al eje horizontal y ``n`` al vertical.
     """
 
     values = np.asarray(image)
@@ -68,13 +92,20 @@ def dht2(
 
     T = _sampling_step(T)
     orders = dhtord(N, D, coefficient_region)
+    N = int(N)
+    if not isinstance(shape, str) or shape.lower() not in {"full", "symm"}:
+        raise ValueError('shape debe ser "full" o "symm".')
+    shape = shape.lower()
     max_individual_order = max(max(order) for order in orders)
     filters = dhtmtx(N, max_individual_order)
+
+    work = values if shape == "full" else _symmetric_extension(values, N)
+    convolution_mode = "full" if shape == "full" else "valid"
 
     channels = []
     for m, n in orders:
         kernel = np.outer(filters[:, n], filters[:, m])
-        channels.append(convolve2d(values, kernel, mode="full")[::T, ::T])
+        channels.append(convolve2d(work, kernel, mode=convolution_mode)[::T, ::T])
     return np.stack(channels, axis=-1).astype(np.float64, copy=False)
 
 

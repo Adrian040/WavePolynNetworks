@@ -3,8 +3,8 @@
 `dhts_py` implementa una representación local de imágenes mediante un filter
 bank discreto de Hermite. La transformada cartesiana produce coefficient maps
 `L_{m,n}`; a partir de ellos se puede estimar una orientación local, aplicar
-steering mediante la RDHT, recuperar los coeficientes cartesianos y sintetizar
-una imagen con la IDHT.
+steering mediante la RDHT, obtener respuestas multidireccionales con la DDHT,
+recuperar los coeficientes cartesianos y sintetizar una imagen con la IDHT.
 
 El banco 1-D parte de una ventana binomial de orden cero. Los filtros de orden
 superior forman la representación discreta relacionada con polinomios de
@@ -16,7 +16,7 @@ Los filtros 2-D se obtienen de manera separable.
 La API pública del paquete contiene solamente:
 
 ```python
-from dhts_py import dhtmtx, dhtord, dht2, gauge, rdht, idht2
+from dhts_py import dhtmtx, dhtord, dht2, gauge, rdht, ddht, idht2
 ```
 
 Las funciones de visualización y métricas se importan desde `dhts_py.utils`.
@@ -32,10 +32,12 @@ array grayscale 2-D.
 - `T >= 1` es el paso espacial de sampling. `T=1` conserva una muestra por
   posición; un valor mayor realiza subsampling.
 - `coefficient_region` puede ser `"triangle"` o `"square"`.
+- `shape` puede ser `"full"` o `"symm"`. El segundo realiza una extensión
+  simétrica que incluye la muestra de borde antes del filtrado válido.
 
-La transformada usa convolución `full`. Para una imagen de shape `(H, W)`, el
-stack tiene shape `(ceil((H+N)/T), ceil((W+N)/T), C)`. El índice `m` corresponde
-al eje horizontal y `n` al vertical.
+Con `shape="full"`, una imagen de shape `(H, W)` produce un stack espacial
+`(ceil((H+N)/T), ceil((W+N)/T))`. El índice `m` corresponde al eje horizontal y
+`n` al vertical. La inversa debe recibir el mismo `shape` usado en la directa.
 
 ### Triangle
 
@@ -69,6 +71,8 @@ coefficient_region = "square"
 Define `M=min(D,N)` y selecciona todos los pares `0 <= m,n <= M`. Por tanto,
 se obtienen 16 mapas, desde `L_{0,0}` hasta `L_{3,3}`. Internamente siguen
 agrupados por orden total; `dhtord` es siempre la fuente de verdad del canal.
+Este conjunto es válido para DHT, IDHT y los gauges disponibles, pero no es
+cerrado bajo steering: RDHT rechaza explícitamente un square parcial.
 
 ### Square completo
 
@@ -79,7 +83,8 @@ coefficient_region = "square"
 ```
 
 Incluye los 81 pares `0 <= m,n <= 8`. Éste es el modo recomendado para
-comprobar la reconstrucción completa con el banco disponible.
+comprobar la reconstrucción completa con el banco disponible. Su orden y su
+RDHT coinciden exactamente con `triangle`, `N=8`, `D=16`.
 
 ## DHT triangular y visualización
 
@@ -97,6 +102,7 @@ coeffs = dht2(
     D=3,
     T=1,
     coefficient_region="triangle",
+    shape="full",
 )
 
 figure, axes = plot_coefficients(
@@ -122,6 +128,7 @@ coeffs = dht2(
     D=3,
     T=1,
     coefficient_region="square",
+    shape="full",
 )
 
 figure, axes = plot_coefficients(
@@ -146,6 +153,7 @@ coeffs = dht2(
     D=8,
     T=1,
     coefficient_region="square",
+    shape="full",
 )
 reconstructed = idht2(
     coeffs,
@@ -154,6 +162,7 @@ reconstructed = idht2(
     D=8,
     T=1,
     coefficient_region="square",
+    shape="full",
 )
 metrics = reconstruction_metrics(image, reconstructed)
 ```
@@ -162,10 +171,10 @@ La síntesis suma exactamente los 81 mapas indicados por `dhtord`; no convierte
 el square en triangle ni descarta términos con `m+n>D`. Las pequeñas diferencias
 respecto a la entrada se deben al redondeo de punto flotante.
 
-## Orientación y RDHT
+## Orientación, RDHT y DDHT
 
 ```python
-from dhts_py import dht2, gauge, rdht
+from dhts_py import ddht, dht2, gauge, rdht
 
 coeffs = dht2(image, N=8, D=3, T=1, coefficient_region="triangle")
 theta = gauge(
@@ -191,11 +200,24 @@ recovered = rdht(
     direction="inverse",
     coefficient_region="triangle",
 )
+
+theta_hessian = gauge(
+    coeffs, N=8, D=3, mode="hessian", coefficient_region="triangle"
+)
+directional = ddht(
+    coeffs,
+    theta_hessian,
+    N=8,
+    D=3,
+    direction="forward",
+    coefficient_region="triangle",
+)
 ```
 
-`gauge` admite `mode="gradient"` y `mode="hessian"`. La RDHT consulta
-`dhtord` para formar cada bloque de orden total, tanto en triangle como en
-square.
+`gauge` admite `mode="gradient"` y `mode="hessian"`. RDHT expresa los
+coeficientes en un sistema rotado; DDHT evalúa respuestas en varias direcciones
+por orden total. La DDHT mínima admite regiones triangulares completas hasta
+`D <= N`. RDHT admite triangle y el square completo `D=N`.
 
 ## Utilidades
 
@@ -209,9 +231,16 @@ square.
 
 ## Dependencias y tests
 
-La implementación requiere NumPy, SciPy y Matplotlib:
+La implementación requiere NumPy, SciPy y Matplotlib. Los scripts visuales usan
+además Pillow para cargar imágenes:
 
 ```powershell
-python -m pip install numpy scipy matplotlib
+python -m pip install numpy scipy matplotlib pillow
 python -m unittest discover -s dhts_py/tests -v
+python -m dhts_py.tests.test_dht2
+python -m dhts_py.tests.test_idht
 ```
+
+Los dos últimos comandos usan `tests/data/lena.jpg`, aceptan `--image RUTA` y
+guardan resultados headless en `tests/resultados/dht` y
+`tests/resultados/idht`. Use `--show` para mostrar también las figuras.
