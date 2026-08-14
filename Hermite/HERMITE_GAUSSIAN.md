@@ -27,3 +27,21 @@ funciones Hermite--Gaussianas desplazadas y divide por la suma de las ventanas
 Gaussianas al cuadrado. Como se conserva un número finito de órdenes, el
 resultado es una aproximación truncada y las métricas reportan su error real.
 
+## Lectura y visualización de imágenes
+
+Todas las entradas se convierten internamente a un array 2-D `float64` sin
+normalizar su escala. Las imágenes `L` conservan sus intensidades; en `LA` se
+usa sólo la luminancia; `RGB` se convierte mediante pesos de luminancia; y en
+`RGBA` se ignora alpha antes de aplicar la misma conversión. Los TIFF grayscale
+de 16 bits conservan sus valores. Las rutas y objetos PIL respetan además la
+orientación EXIF.
+
+Las imágenes de intensidad, la energía y los coefficient maps se renderizan en
+grayscale por defecto. Esto afecta únicamente los archivos de visualización y
+no modifica ningún array utilizado por la transformada. `theta` mantiene el
+colormap cíclico `twilight`, porque representa ángulos y no intensidades.
+
+`output_paths` admite, entre otras, las claves `original_image`,
+`cartesian_coefficients`, `rotated_coefficients`, `theta`, `reconstruction`,
+`reconstructed_image`, `coefficient_energy` y `metrics_csv`.
+

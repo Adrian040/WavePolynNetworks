@@ -3,11 +3,161 @@
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
+import tempfile
 import unittest
 
 import numpy as np
+from PIL import Image, ImageOps
 
 import full_hermite_transform_refactored as ht
+
+
+def _expected_luminance(rgb):
+    weights = np.asarray(
+        [0.298936021293775, 0.587043074451121, 0.114020904255103]
+    )
+    return np.tensordot(
+        np.asarray(rgb, dtype=np.float64)[..., :3], weights, axes=([-1], [0])
+    )
+
+
+class ImageReadingTests(unittest.TestCase):
+    def test_grayscale_and_single_channel_preserve_intensities(self):
+        grayscale = np.asarray([[0, 17, 255], [9, 81, 143]], dtype=np.uint8)
+        direct = ht.read_image(grayscale)
+        singleton = ht.read_image(grayscale[..., None])
+        self.assertEqual(direct.dtype, np.float64)
+        self.assertEqual(direct.ndim, 2)
+        np.testing.assert_array_equal(direct, grayscale.astype(np.float64))
+        np.testing.assert_array_equal(singleton, direct)
+
+    def test_two_channels_and_la_tiff_ignore_alpha(self):
+        luminance = np.asarray([[3, 27, 240], [91, 12, 188]], dtype=np.uint8)
+        alpha = np.asarray([[0, 64, 255], [255, 1, 127]], dtype=np.uint8)
+        luminance_alpha = np.dstack((luminance, alpha))
+        np.testing.assert_array_equal(
+            ht.read_image(luminance_alpha), luminance.astype(np.float64)
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "luminance_alpha.tif"
+            Image.fromarray(luminance_alpha, mode="LA").save(path)
+            loaded = ht.read_image(path)
+        self.assertEqual(loaded.dtype, np.float64)
+        self.assertEqual(loaded.ndim, 2)
+        np.testing.assert_array_equal(loaded, luminance.astype(np.float64))
+
+    def test_rgb_png_path_pil_and_array_use_identical_luminance(self):
+        rgb = np.asarray(
+            [
+                [[255, 0, 0], [0, 255, 0], [0, 0, 255]],
+                [[12, 34, 56], [200, 100, 50], [1, 2, 3]],
+            ],
+            dtype=np.uint8,
+        )
+        expected = _expected_luminance(rgb)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rgb.png"
+            pil_image = Image.fromarray(rgb, mode="RGB")
+            pil_image.save(path)
+            from_path = ht.read_image(path)
+            from_pil = ht.read_image(pil_image)
+        from_array = ht.read_image(rgb)
+        for result in (from_path, from_pil, from_array):
+            self.assertEqual(result.dtype, np.float64)
+            self.assertEqual(result.shape, rgb.shape[:2])
+            np.testing.assert_allclose(result, expected, rtol=0.0, atol=1e-12)
+
+    def test_rgb_jpeg_path_matches_its_decoded_array(self):
+        rng = np.random.default_rng(123)
+        rgb = rng.integers(0, 256, size=(11, 13, 3), dtype=np.uint8)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rgb.jpg"
+            Image.fromarray(rgb, mode="RGB").save(
+                path, quality=100, subsampling=0
+            )
+            with Image.open(path) as decoded_image:
+                decoded_rgb = np.asarray(decoded_image.convert("RGB"))
+            from_path = ht.read_image(path)
+        from_array = ht.read_image(decoded_rgb)
+        np.testing.assert_allclose(from_path, from_array, rtol=0.0, atol=1e-12)
+        np.testing.assert_allclose(
+            from_path, _expected_luminance(decoded_rgb), rtol=0.0, atol=1e-12
+        )
+
+    def test_rgba_alpha_does_not_change_grayscale(self):
+        rgb = np.asarray(
+            [[[20, 50, 90], [250, 100, 5]], [[0, 1, 2], [80, 70, 60]]],
+            dtype=np.uint8,
+        )
+        rgba_zero = np.dstack((rgb, np.zeros(rgb.shape[:2], dtype=np.uint8)))
+        rgba_full = np.dstack((rgb, np.full(rgb.shape[:2], 255, dtype=np.uint8)))
+        first = ht.read_image(rgba_zero)
+        second = ht.read_image(rgba_full)
+        np.testing.assert_array_equal(first, second)
+        np.testing.assert_allclose(first, _expected_luminance(rgb), atol=1e-12)
+
+    def test_16_bit_grayscale_tiff_preserves_values(self):
+        grayscale = np.asarray(
+            [[0, 256, 1024], [4095, 32768, 65535]], dtype=np.uint16
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grayscale16.tif"
+            Image.fromarray(grayscale).save(path)
+            loaded = ht.read_image(path)
+        self.assertEqual(loaded.dtype, np.float64)
+        np.testing.assert_array_equal(loaded, grayscale.astype(np.float64))
+        self.assertEqual(float(np.max(loaded)), 65535.0)
+
+    def test_palette_and_cmyk_are_interpreted_as_rgb(self):
+        palette = Image.new("P", (2, 1))
+        palette.putpalette([255, 0, 0, 0, 255, 0] + [0] * (256 * 3 - 6))
+        palette.putdata([0, 1])
+        palette_rgb = np.asarray(palette.convert("RGB"))
+        np.testing.assert_allclose(
+            ht.read_image(palette), _expected_luminance(palette_rgb), atol=1e-12
+        )
+
+        cmyk = Image.new("CMYK", (2, 1), color=(10, 80, 140, 20))
+        cmyk_rgb = np.asarray(cmyk.convert("RGB"))
+        np.testing.assert_allclose(
+            ht.read_image(cmyk), _expected_luminance(cmyk_rgb), atol=1e-12
+        )
+
+    def test_exif_orientation_is_applied_before_grayscale(self):
+        rgb = np.zeros((2, 3, 3), dtype=np.uint8)
+        rgb[0, 0] = [255, 0, 0]
+        rgb[1, 2] = [0, 255, 0]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "oriented.jpg"
+            exif = Image.Exif()
+            exif[274] = 6
+            Image.fromarray(rgb, mode="RGB").save(
+                path, quality=100, subsampling=0, exif=exif
+            )
+            with Image.open(path) as encoded:
+                oriented_rgb = np.asarray(
+                    ImageOps.exif_transpose(encoded).convert("RGB")
+                )
+            loaded = ht.read_image(path)
+        self.assertEqual(loaded.shape, (3, 2))
+        np.testing.assert_allclose(
+            loaded, _expected_luminance(oriented_rgb), rtol=0.0, atol=1e-12
+        )
+
+    def test_invalid_arrays_raise_clear_errors(self):
+        invalid_inputs = [
+            np.zeros((4,)),
+            np.zeros((2, 3, 5)),
+            np.zeros((2, 3), dtype=np.complex128),
+            np.asarray([["not", "numeric"]]),
+            np.asarray([[np.nan]]),
+        ]
+        for invalid in invalid_inputs:
+            with self.subTest(shape=invalid.shape, dtype=invalid.dtype):
+                with self.assertRaises(ValueError):
+                    ht.read_image(invalid)
 
 
 class OrderAndFilterTests(unittest.TestCase):
@@ -183,6 +333,67 @@ class SteeringTests(unittest.TestCase):
 
 
 class SynthesisAndWorkflowTests(unittest.TestCase):
+    def test_visual_outputs_are_grayscale_except_theta(self):
+        self.assertEqual(
+            inspect.signature(ht.save_coefficients_grid).parameters[
+                "cmap"
+            ].default,
+            "gray",
+        )
+        image = np.arange(9 * 11, dtype=float).reshape(9, 11)
+        coefficients = {
+            (0, 0): image.copy(),
+            (1, 0): image.copy() - np.mean(image),
+        }
+        preserved = {order: values.copy() for order, values in coefficients.items()}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            coefficient_path = root / "coefficients.png"
+            comparison_path = root / "comparison.png"
+            theta_path = root / "theta.png"
+            original_path = root / "original.png"
+            energy_path = root / "energy.png"
+            ht.save_coefficients_grid(coefficients, coefficient_path, "Coefficients")
+            ht.save_reconstruction_comparison(
+                image, image + 1.0, comparison_path
+            )
+            ht.save_theta_image(
+                np.linspace(-np.pi, np.pi, image.size).reshape(image.shape),
+                theta_path,
+            )
+            result = ht.hermite_transform_image(
+                image,
+                max_order=1,
+                coefficient_region="triangle",
+                use_rotation=False,
+                use_inverse_rotation=False,
+                use_inverse_transform=False,
+                output_paths={
+                    "original_image": original_path,
+                    "coefficient_energy": energy_path,
+                },
+            )
+
+            for path in (
+                coefficient_path,
+                comparison_path,
+                original_path,
+                energy_path,
+            ):
+                rgb = np.asarray(Image.open(path).convert("RGB"), dtype=int)
+                self.assertTrue(np.array_equal(rgb[..., 0], rgb[..., 1]), path)
+                self.assertTrue(np.array_equal(rgb[..., 1], rgb[..., 2]), path)
+            theta_rgb = np.asarray(Image.open(theta_path).convert("RGB"), dtype=int)
+            self.assertTrue(
+                np.any(theta_rgb[..., 0] != theta_rgb[..., 1])
+                or np.any(theta_rgb[..., 1] != theta_rgb[..., 2])
+            )
+
+        for order in coefficients:
+            np.testing.assert_array_equal(coefficients[order], preserved[order])
+        np.testing.assert_array_equal(result["original_image"], image)
+
     def test_synthesis_shape_finiteness_and_sampling(self):
         rng = np.random.default_rng(11)
         image = rng.normal(size=(28, 31))

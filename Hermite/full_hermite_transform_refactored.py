@@ -20,7 +20,7 @@ from typing import Dict, Mapping, Optional, Sequence, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 from scipy.ndimage import convolve1d, correlate1d
 from scipy.special import eval_hermite, gammaln
 
@@ -31,6 +31,10 @@ PathLike = Union[str, Path]
 
 _SUPPORT_TOLERANCE = 1e-8
 _TAIL_SAMPLES = 3
+_RGB_LUMINANCE_WEIGHTS = np.asarray(
+    [0.298936021293775, 0.587043074451121, 0.114020904255103],
+    dtype=np.float64,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -38,57 +42,99 @@ _TAIL_SAMPLES = 3
 # -----------------------------------------------------------------------------
 
 
-def read_image(image: Union[PathLike, Image.Image, Array], dtype=np.float64) -> Array:
+def _array_to_grayscale(image: Array, source: str) -> Array:
+    """Convert a numeric image array to grayscale without changing its scale."""
+    array = np.asarray(image)
+    original_shape = array.shape
+    if np.iscomplexobj(array):
+        raise ValueError(
+            f"{source} has complex values; a real grayscale image is required."
+        )
+    if not (
+        np.issubdtype(array.dtype, np.number)
+        or np.issubdtype(array.dtype, np.bool_)
+    ):
+        raise ValueError(
+            f"{source} must contain numeric image data; received dtype {array.dtype}."
+        )
+
+    if array.ndim == 2:
+        grayscale = array
+    elif array.ndim == 3:
+        channels = array.shape[-1]
+        if channels in {1, 2}:
+            # One channel is grayscale; two channels are luminance + alpha.
+            grayscale = array[..., 0]
+        elif channels in {3, 4}:
+            # Alpha is display metadata and never enters the transform.
+            rgb = array[..., :3].astype(np.float64, copy=False)
+            grayscale = np.tensordot(
+                rgb, _RGB_LUMINANCE_WEIGHTS, axes=([-1], [0])
+            )
+        else:
+            raise ValueError(
+                f"{source} has shape {original_shape}; expected 1, 2, 3 or 4 "
+                "channels in the last dimension."
+            )
+    else:
+        raise ValueError(
+            f"{source} has shape {original_shape}; expected (height, width) "
+            "or (height, width, channels)."
+        )
+
+    result = np.asarray(grayscale, dtype=np.float64)
+    if result.ndim != 2:
+        raise ValueError(
+            f"{source} could not be converted to a 2-D image; got shape "
+            f"{result.shape}."
+        )
+    if result.size == 0:
+        raise ValueError(f"{source} is empty.")
+    if not np.isfinite(result).all():
+        raise ValueError(f"{source} contains NaN or infinite values.")
+    return result
+
+
+def _pil_to_grayscale(image: Image.Image, source: str) -> Array:
+    """Apply EXIF orientation and convert a PIL image through the shared path."""
+    oriented = ImageOps.exif_transpose(image)
+    mode = oriented.mode
+    direct_modes = {"1", "L", "LA", "I", "F", "RGB", "RGBA", "RGBX"}
+    if mode in direct_modes or mode.startswith("I;16"):
+        array = np.asarray(oriented)
+    else:
+        # Palette, CMYK, YCbCr and other encoded color spaces must first be
+        # interpreted by PIL; the common RGB luminance formula is applied next.
+        array = np.asarray(oriented.convert("RGB"))
+    return _array_to_grayscale(array, f"{source} (PIL mode {mode!r})")
+
+
+def read_image(image: Union[PathLike, Image.Image, Array]) -> Array:
     """Read an image as a two-dimensional grayscale array.
 
     Parameters
     ----------
     image : path-like, PIL.Image.Image or ndarray
         Input image. RGB arrays are converted with standard luminance weights.
-    dtype : numpy dtype, default=float64
-        Output dtype.
-
     Returns
     -------
     image_array : ndarray
-        Two-dimensional image in its original numeric scale.
+        Two-dimensional ``float64`` image in its original numeric scale.
 
     Notes
     -----
-    Integer images are converted to floating point without rescaling. In
-    particular, an 8-bit file remains in the range ``0..255``.
+    Integer images are converted to ``float64`` without rescaling. In
+    particular, an 8-bit file remains in ``0..255`` and a 16-bit grayscale
+    TIFF is not reduced to 8 bits. RGB and RGBA inputs use the same luminance
+    weights whether they come from a path, a PIL image or an array. Alpha is
+    ignored. EXIF orientation is applied to PIL-backed inputs.
     """
     if isinstance(image, (str, Path)):
         with Image.open(image) as pil_image:
-            result = np.asarray(pil_image.convert("L"), dtype=dtype)
+            return _pil_to_grayscale(pil_image, f"image file {str(image)!r}")
     elif isinstance(image, Image.Image):
-        result = np.asarray(image.convert("L"), dtype=dtype)
-    else:
-        result = np.asarray(image)
-        if result.ndim == 3:
-            if result.shape[-1] >= 3:
-                rgb = result[..., :3].astype(dtype)
-                result = (
-                    0.2126 * rgb[..., 0]
-                    + 0.7152 * rgb[..., 1]
-                    + 0.0722 * rgb[..., 2]
-                )
-            elif result.shape[-1] == 2:
-                result = result[..., 0]
-            else:
-                result = np.squeeze(result, axis=-1)
-        if result.ndim != 2:
-            raise ValueError(
-                "The input image must be 2-D after conversion; "
-                f"got shape {result.shape}."
-            )
-        result = result.astype(dtype, copy=False)
-
-    if result.size == 0:
-        raise ValueError("The input image is empty.")
-    if not np.isfinite(result).all():
-        raise ValueError("The input image contains NaN or infinite values.")
-    return result.astype(dtype, copy=False)
+        return _pil_to_grayscale(image, "PIL image")
+    return _array_to_grayscale(image, "input array")
 
 
 def _ensure_parent(path: Optional[PathLike]) -> Optional[Path]:
@@ -869,11 +915,60 @@ def energy_image(
 
 
 def save_coefficients_grid(
-    coefficients: Mapping[Order, Array], output_path: PathLike, title: str
+    coefficients: Mapping[Order, Array],
+    output_path: PathLike,
+    title: str,
+    *,
+    cmap: str = "gray",
 ) -> None:
-    """Save coefficient maps in their ``(m, n)`` positions."""
-    path = _ensure_parent(output_path)
+    """Save coefficient maps in their ``(m, n)`` positions.
+
+    Parameters
+    ----------
+    coefficients : mapping
+        Scalar coefficient maps indexed by ``(m, n)``.
+    output_path : path-like
+        Destination image path.
+    title : str
+        Figure title.
+    cmap : str, default="gray"
+        Matplotlib colormap. The symmetric display limits place zero at the
+        midpoint of the grayscale range.
+
+    Notes
+    -----
+    The colormap and display limits affect only the rendered figure. They never
+    modify the coefficient arrays used by analysis, steering or synthesis.
+    """
+    if not coefficients:
+        raise ValueError("At least one coefficient map is required.")
     orders = list(coefficients.keys())
+    if any(
+        not isinstance(order, tuple)
+        or len(order) != 2
+        or any(
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, np.integer))
+            or value < 0
+            for value in order
+        )
+        for order in orders
+    ):
+        raise ValueError("Coefficient keys must be non-negative integer pairs (m, n).")
+    display_values = {}
+    for order in orders:
+        value = np.asarray(coefficients[order])
+        if value.ndim != 2 or value.size == 0 or np.iscomplexobj(value):
+            raise ValueError(
+                f"Coefficient L_{order} must be a non-empty, real 2-D array."
+            )
+        if not np.isfinite(value).all():
+            raise ValueError(
+                f"Coefficient L_{order} contains NaN or infinite values."
+            )
+        display_values[order] = value
+
+    path = _ensure_parent(output_path)
     max_m = max(m for m, _ in orders)
     max_n = max(n for _, n in orders)
     figure, axes = plt.subplots(
@@ -886,10 +981,10 @@ def save_coefficients_grid(
         for m in range(max_m + 1):
             axis = axes[n, m]
             order = (m, n)
-            if order in coefficients:
-                value = np.asarray(coefficients[order])
+            if order in display_values:
+                value = display_values[order]
                 limit = max(float(np.max(np.abs(value))), np.finfo(float).eps)
-                axis.imshow(value, cmap="coolwarm", vmin=-limit, vmax=limit)
+                axis.imshow(value, cmap=cmap, vmin=-limit, vmax=limit)
                 axis.set_title(rf"$L_{{{m},{n}}}$")
             axis.axis("off")
     figure.suptitle(title)
@@ -899,13 +994,59 @@ def save_coefficients_grid(
 
 
 def save_theta_image(theta: Array, output_path: PathLike) -> None:
-    """Save an orientation map expressed visually in degrees."""
+    """Save an orientation map in degrees with a cyclic angular colormap."""
+    angle = np.asarray(theta)
+    if angle.ndim != 2 or angle.size == 0 or np.iscomplexobj(angle):
+        raise ValueError("theta must be a non-empty, real two-dimensional map.")
+    if not np.isfinite(angle).all():
+        raise ValueError("theta contains NaN or infinite values.")
     path = _ensure_parent(output_path)
     figure, axis = plt.subplots(figsize=(7, 6))
-    shown = axis.imshow(np.rad2deg(theta), cmap="twilight", vmin=-180, vmax=180)
+    shown = axis.imshow(np.rad2deg(angle), cmap="twilight", vmin=-180, vmax=180)
     axis.set_title(r"Orientacion local $\theta$ [grados]")
     axis.axis("off")
     figure.colorbar(shown, ax=axis)
+    figure.tight_layout()
+    figure.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(figure)
+
+
+def save_intensity_image(
+    image: Array,
+    output_path: PathLike,
+    title: str,
+) -> None:
+    """Save a two-dimensional scalar image using explicit grayscale display.
+
+    Parameters
+    ----------
+    image : ndarray, shape (rows, columns)
+        Intensity image or non-negative scalar summary.
+    output_path : path-like
+        Destination image path.
+    title : str
+        Figure title.
+
+    Notes
+    -----
+    Rendering does not normalize or mutate ``image``. Matplotlib maps its
+    numeric range to grayscale only in the saved visualization.
+    """
+    values = np.asarray(image)
+    if values.ndim != 2 or values.size == 0 or np.iscomplexobj(values):
+        raise ValueError("image must be a non-empty, real two-dimensional array.")
+    if not np.isfinite(values).all():
+        raise ValueError("image contains NaN or infinite values.")
+
+    path = _ensure_parent(output_path)
+    lower = float(np.min(values))
+    upper = float(np.max(values))
+    if lower == upper:
+        upper = lower + 1.0
+    figure, axis = plt.subplots(figsize=(7, 6))
+    axis.imshow(values, cmap="gray", vmin=lower, vmax=upper)
+    axis.set_title(title)
+    axis.axis("off")
     figure.tight_layout()
     figure.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(figure)
@@ -915,9 +1056,25 @@ def save_reconstruction_comparison(
     original: Array, reconstructed: Array, output_path: PathLike
 ) -> None:
     """Save original, reconstructed image and absolute error."""
+    source = np.asarray(original)
+    estimate = np.asarray(reconstructed)
+    if (
+        source.ndim != 2
+        or estimate.ndim != 2
+        or source.size == 0
+        or source.shape != estimate.shape
+        or np.iscomplexobj(source)
+        or np.iscomplexobj(estimate)
+    ):
+        raise ValueError(
+            "original and reconstructed must be non-empty, real 2-D arrays "
+            "with the same shape."
+        )
+    if not np.isfinite(source).all() or not np.isfinite(estimate).all():
+        raise ValueError("original and reconstructed must contain finite values.")
     path = _ensure_parent(output_path)
-    original64 = np.asarray(original, dtype=np.float64)
-    reconstructed64 = np.asarray(reconstructed, dtype=np.float64)
+    original64 = source.astype(np.float64, copy=False)
+    reconstructed64 = estimate.astype(np.float64, copy=False)
     error = np.abs(original64 - reconstructed64)
     lower = float(min(np.min(original64), np.min(reconstructed64)))
     upper = float(max(np.max(original64), np.max(reconstructed64)))
@@ -929,7 +1086,7 @@ def save_reconstruction_comparison(
     axes[0].set_title("Original")
     axes[1].imshow(reconstructed64, cmap="gray", vmin=lower, vmax=upper)
     axes[1].set_title("Reconstruida")
-    shown_error = axes[2].imshow(error, cmap="magma", vmin=0.0)
+    shown_error = axes[2].imshow(error, cmap="gray", vmin=0.0)
     axes[2].set_title(r"Error absoluto $|I-\hat I|$")
     for axis in axes:
         axis.axis("off")
@@ -1000,9 +1157,10 @@ def hermite_transform_image(
     angle_unit : {"degrees", "radians"}, default="degrees"
         Unit of ``angle`` in fixed mode.
     output_paths : mapping, optional
-        Paths keyed by ``cartesian_coefficients``, ``rotated_coefficients``,
-        ``recovered_cartesian_coefficients``, ``theta``, ``reconstruction`` or
-        ``metrics_csv``.
+        Paths keyed by ``original_image``, ``cartesian_coefficients``,
+        ``rotated_coefficients``, ``recovered_cartesian_coefficients``,
+        ``theta``, ``reconstruction``, ``reconstructed_image``,
+        ``coefficient_energy``, ``transformed_image`` or ``metrics_csv``.
 
     Returns
     -------
@@ -1025,8 +1183,14 @@ def hermite_transform_image(
     ):
         raise ValueError("Workflow flags must be boolean values.")
 
-    image_array = read_image(image, dtype=np.float64)
+    image_array = read_image(image)
     paths = dict(output_paths or {})
+    if "original_image" in paths:
+        save_intensity_image(
+            image_array,
+            paths["original_image"],
+            "Imagen original en escala de grises",
+        )
     filter_bank = build_hermite_gaussian_filter_bank(
         max_order=max_order,
         sigma=sigma,
@@ -1142,6 +1306,12 @@ def hermite_transform_image(
             save_reconstruction_comparison(
                 image_array, reconstructed_image, paths["reconstruction"]
             )
+        if "reconstructed_image" in paths:
+            save_intensity_image(
+                reconstructed_image,
+                paths["reconstructed_image"],
+                "Imagen reconstruida",
+            )
 
     all_metrics: dict[str, float] = {}
     if coefficient_metrics is not None:
@@ -1156,6 +1326,18 @@ def hermite_transform_image(
     )
     active_stack = _coefficients_to_stack(active_coefficients, public_orders)
     coefficient_energy = energy_image(active_coefficients)
+    if "coefficient_energy" in paths:
+        save_intensity_image(
+            coefficient_energy,
+            paths["coefficient_energy"],
+            "Energia de coeficientes Hermite",
+        )
+    if "transformed_image" in paths:
+        save_intensity_image(
+            coefficient_energy,
+            paths["transformed_image"],
+            "Energia de coeficientes Hermite",
+        )
 
     return {
         "original_image": image_array,
@@ -1190,11 +1372,14 @@ if __name__ == "__main__":
         use_inverse_transform=True,
         rotation_mode="dominant",
         output_paths={
+            "original_image": "results/original_grayscale.png",
             "cartesian_coefficients": "results/cartesian_coefficients.png",
             "rotated_coefficients": "results/rotated_coefficients.png",
             "recovered_cartesian_coefficients": "results/recovered_cartesian.png",
             "theta": "results/theta.png",
             "reconstruction": "results/reconstruction.png",
+            "reconstructed_image": "results/reconstructed_grayscale.png",
+            "coefficient_energy": "results/coefficient_energy.png",
             "metrics_csv": "results/metrics.csv",
         },
     )
