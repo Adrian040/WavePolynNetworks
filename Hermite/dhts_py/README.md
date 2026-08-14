@@ -62,6 +62,30 @@ python -m dhts_py
 
 Las pruebas verifican filtros binomiales, paridad, reconstrucción 1-D/2-D/3-D, involución FBT, ida y vuelta RDHT, quadtree y presencia de los 74 módulos homólogos.
 
+## Prueba visual cartesiana, rotada y multidireccional
+
+El equivalente del ejemplo MATLAB con `N=8`, `D=2`, `T=2`, `symm`,
+`r/grad` y `d/hess` está en `test_dht2_lena.py`:
+
+```powershell
+python dhts_py/test_dht2_lena.py
+python dhts_py/test_dht2_lena.py --save-dir resultados_dht
+```
+
+La segunda forma guarda tres figuras etiquetadas y tres mosaicos sin títulos,
+márgenes ni reescalado, apropiados para compararlos directamente con MATLAB.
+
+La prueba directa/inversa equivalente al script de reconstrucción MATLAB está
+en `test_idht_lena.py`:
+
+```powershell
+python dhts_py/test_idht_lena.py
+python dhts_py/test_idht_lena.py --save-dir resultados_idht
+```
+
+La opción `--save-dir` guarda la figura comparativa y un archivo NPZ con la
+imagen, los coeficientes y las tres reconstrucciones.
+
 ## Dependencias externas ausentes en el material
 
 Dos ramas del MATLAB original cargan archivos que no estaban entre los archivos entregados:
@@ -70,4 +94,3 @@ Dos ramas del MATLAB original cargan archivos que no estaban entre los archivos 
 - `zcross.m` carga `scest.mat` para estimar escala y contraste. La máscara de cruces por cero funciona sin él; para las salidas de escala/contraste se debe pasar el arreglo del modelo con `scale_model=`.
 
 Consulta `PORTING_NOTES.md` para las erratas reparadas y los límites de equivalencia.
-
